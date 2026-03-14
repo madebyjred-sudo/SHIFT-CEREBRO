@@ -1,0 +1,15 @@
+[build]
+builder = "nixpacks"
+
+[deploy]
+startCommand = "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}"
+healthcheckPath = "/health"
+healthcheckTimeout = 60
+restartPolicyType = "on_failure"
+restartPolicyMaxRetries = 3
+
+# Variables de entorno por defecto
+[deploy.env]
+ALLOWED_ORIGINS = "http://localhost:3000,http://localhost:3001,http://localhost:5173,https://shiftpn.com"
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+MYSQL_PORT = "3306"

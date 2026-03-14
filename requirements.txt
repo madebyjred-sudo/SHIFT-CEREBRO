@@ -1,0 +1,27 @@
+# Shift Cerebro - Python Dependencies
+# Instalar con: pip install -r requirements.txt
+
+# Web Framework
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+
+# LangChain & AI
+langchain>=0.1.0
+langchain-openai>=0.0.5
+langgraph>=0.0.20
+
+# Database
+pymysql>=1.1.0
+cryptography>=41.0.0  # Required for MySQL SSL connections
+
+# Environment
+python-dotenv>=1.0.0
+
+# Pydantic for data validation
+pydantic>=2.5.0
+
+# Optional but recommended
+httpx>=0.25.0  # For async HTTP requests
+
+# cPanel Deployment (Passenger WSGI bridge)
+a2wsgi>=1.7.0  # Bridges ASGI (FastAPI) to WSGI (Passenger)
