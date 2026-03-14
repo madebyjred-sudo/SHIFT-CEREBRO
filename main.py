@@ -73,10 +73,15 @@ def get_llm(model_name: str = "Claude 3.5 Sonnet"):
         openrouter_model = model_name
     else:
         openrouter_model = MODEL_MAP.get(model_name, "anthropic/claude-sonnet-4.6")
+    
+    # Obtener API key de OpenRouter (puede ser OPENROUTER_API_KEY u OPENAI_API_KEY)
+    api_key = os.getenv("OPENROUTER_API_KEY") or os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        raise ValueError("OPENROUTER_API_KEY or OPENAI_API_KEY must be set")
         
     return ChatOpenAI(
         model=openrouter_model,
-        openai_api_key=os.getenv("OPENROUTER_API_KEY"),
+        openai_api_key=api_key,
         openai_api_base=os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"),
         default_headers={
             "HTTP-Referer": "https://shiftpn.com",
