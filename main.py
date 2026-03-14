@@ -1,6 +1,7 @@
 import os
 import json
 import hashlib
+import time
 from datetime import datetime
 from typing import List, Optional, Annotated, TypedDict, Dict, Any
 from fastapi import FastAPI, HTTPException
@@ -12,6 +13,17 @@ from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage, BaseMessage
 from langchain_core.tools import tool
 
+# Punto Medio & PII Scrubber — Membrana Neuronal v2.0
+from pii_scrubber import full_scrub_pipeline, check_deduplication
+from punto_medio import (
+    get_dynamic_rag, 
+    consolidate_punto_medio, 
+    get_peaje_stats,
+    get_tenant_insights_summary,
+    log_prompt_refinement,
+    SEED_GLOBAL_RAG,
+    SEED_TENANT_CONTEXTS,
+)
 
 # MySQL Connection
 try:
@@ -69,7 +81,7 @@ MODEL_MAP = {
 def get_llm(model_name: str = "Claude 3.5 Sonnet"):
     """Get LLM instance for specific model"""
     # Si es una llamada interna del extractor (backend-only), usamos el string directo
-    if model_name.startswith("google/") or model_name.startswith("meta-llama/"):
+    if "/" in model_name and not model_name.startswith("http"):
         openrouter_model = model_name
     else:
         openrouter_model = MODEL_MAP.get(model_name, "anthropic/claude-sonnet-4.6")
@@ -379,18 +391,36 @@ class DebateDashboardRequest(BaseModel):
     session_id: Optional[str] = None
 
 def create_agent_node_with_model(agent_id: str, model_name: str, tenant_id: str = "shift"):
-    """Factory function para crear nodos de agentes con modelo específico e inyección de RAG/Tenant."""
+    """Factory function para crear nodos de agentes con modelo específico e inyección de RAG/Tenant DINÁMICO."""
     def agent_node(state: SwarmState):
         agent_info = AGENTS[agent_id]
         # Asegurar que tid sea siempre string
         tid = str(tenant_id) if tenant_id is not None else "shift"
-        tenant_context = TENANT_CONTEXTS.get(tid, TENANT_CONTEXTS["shift"])
         
-        # INYECCIÓN DEL RAG (Synthetic Graph Injection)
+        # ═══════════════════════════════════════════════════════════
+        # DYNAMIC RAG INJECTION — Punto Medio v2.0
+        # Replaces hardcoded PUNTO_MEDIO_GLOBAL_RAG with REAL data
+        # from the consolidated institutional memory.
+        # Falls back to seed data if DB is unavailable.
+        # ═══════════════════════════════════════════════════════════
+        try:
+            rag_conn = get_db_connection()
+            dynamic_rag = get_dynamic_rag(rag_conn, tid)
+            punto_medio_injection = dynamic_rag["combined_rag"]
+            if rag_conn:
+                rag_conn.close()
+        except Exception as rag_err:
+            print(f"[DYNAMIC RAG] Falling back to seed: {rag_err}")
+            punto_medio_injection = PUNTO_MEDIO_GLOBAL_RAG
+        
+        # Tenant context: try dynamic first, then hardcoded seed
+        tenant_context = TENANT_CONTEXTS.get(tid, SEED_TENANT_CONTEXTS.get(tid, TENANT_CONTEXTS.get("shift", "")))
+        
+        # INYECCIÓN DEL RAG (Dynamic Graph Injection)
         system_content = f"""
 {SHIFT_LAB_CONTEXT}
 {tenant_context}
-{PUNTO_MEDIO_GLOBAL_RAG}
+{punto_medio_injection}
 
 TU ROL ACTUAL (ESPECIALISTA):
 {agent_info['skill']}
@@ -772,51 +802,96 @@ Debes responder ÚNICAMENTE con un JSON válido con esta estructura exacta:
 
 @app.post("/peaje/ingest")
 async def peaje_ingest(request: PeajeIngestRequest):
-    """Ingesta asíncrona hacia el Flywheel (El Peaje)"""
+    """Ingesta asíncrona hacia el Flywheel (El Peaje) — v2.0 con PII Scrubber + Taxonomy Validation"""
+    extraction_start = time.time()
     try:
-        print(f"[EL PEAJE] Processing: Tenant={request.tenantId}, Agent={request.agentId}")
+        print(f"[EL PEAJE v2] Processing: Tenant={request.tenantId}, Agent={request.agentId}")
         
-        # Extracción Agéntica
-        insight_data = await extract_insight_data_async(request.messages, request.response, request.tenantId)
-        
-        # Generate hashes for anonymization
+        # Generate hashes for anonymization & deduplication
         conversation_text = json.dumps([{"role": m.role, "content": m.content} for m in request.messages])
         anonymized_hash = hashlib.sha256(f"{request.tenantId}:{request.sessionId}:{datetime.now().isoformat()}".encode()).hexdigest()
         conversation_hash = hashlib.sha256(conversation_text.encode()).hexdigest()
-        
+
         # Get database connection
         conn = get_db_connection()
+        
+        # ═══ DEDUPLICATION CHECK ═══
+        if conn and check_deduplication(conversation_hash, conn):
+            print(f"[EL PEAJE v2] Duplicate detected, skipping: {conversation_hash[:16]}...")
+            if conn:
+                conn.close()
+            return {"status": "deduplicated", "tenant": request.tenantId, "conversation_hash": conversation_hash[:16]}
+        
+        # ═══ STEP 1: LLM Extraction (Layer 1 — Probabilistic) ═══
+        insight_data = await extract_insight_data_async(request.messages, request.response, request.tenantId)
+        
+        # ═══ STEP 2: PII Scrubber (Layer 2 — Deterministic) ═══
+        # Get tenant industry for context
+        tenant_industry = None
+        if conn:
+            try:
+                with conn.cursor() as cursor:
+                    cursor.execute("SELECT industry_vertical FROM peaje_tenants WHERE tenant_id = %s", (request.tenantId,))
+                    tenant_row = cursor.fetchone()
+                    if tenant_row:
+                        tenant_industry = tenant_row.get("industry_vertical")
+            except Exception:
+                pass
+        
+        scrub_result = full_scrub_pipeline(
+            insight_text=insight_data["insight_text"],
+            raw_category=insight_data["category"],
+            tenant_industry=tenant_industry,
+            conversation_text=conversation_text,
+        )
+        
+        extraction_duration_ms = int((time.time() - extraction_start) * 1000)
+        extraction_model = "minimax/minimax-m2.5"
+        
+        print(f"[EL PEAJE v2] PII Scrubbed: {scrub_result['total_pii_scrubbed']} items | "
+              f"Category: {scrub_result['original_category']} → {scrub_result['validated_category']} "
+              f"(valid={scrub_result['category_was_valid']}) | "
+              f"Industry: {scrub_result['industry_vertical']}")
         
         if conn:
             try:
                 with conn.cursor() as cursor:
-                    # Insert insight into peaje_insights
+                    # ═══ STEP 3: Insert insight with v2.0 schema ═══
                     sql = """
                         INSERT INTO peaje_insights 
-                        (tenant_id, session_id, agent_id, insight_text, category, sentiment, 
-                         confidence_score, anonymized_hash, raw_conversation_hash)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        (tenant_id, session_id, agent_id, insight_text, 
+                         category, sub_category, industry_vertical,
+                         sentiment, confidence_score, extraction_model, pii_scrubbed,
+                         source_type, anonymized_hash, raw_conversation_hash)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     """
                     cursor.execute(sql, (
                         request.tenantId,
                         request.sessionId,
                         request.agentId,
-                        insight_data["insight_text"],
-                        insight_data["category"],
+                        scrub_result["scrubbed_text"],           # PII-scrubbed text
+                        scrub_result["validated_category"],       # Taxonomy-validated category
+                        scrub_result["sub_category"],             # Sub-category (may be None)
+                        scrub_result["industry_vertical"],        # Detected industry
                         insight_data["sentiment"],
-                        0.75,  # confidence score placeholder
+                        insight_data["confidence_score"],         # REAL confidence from LLM
+                        extraction_model,
+                        scrub_result["pii_scrubbed"],             # TRUE if PII was found & scrubbed
+                        "chat",                                   # source_type
                         anonymized_hash,
                         conversation_hash
                     ))
+                    insight_id = cursor.lastrowid
                     
-                    # Update or insert session tracking
+                    # ═══ STEP 4: Update session tracking ═══
                     session_sql = """
                         INSERT INTO peaje_sessions 
-                        (tenant_id, session_id, message_count, agents_used, source)
-                        VALUES (%s, %s, %s, %s, %s)
+                        (tenant_id, session_id, message_count, insight_count, agents_used, source, debate_mode)
+                        VALUES (%s, %s, %s, 1, %s, %s, FALSE)
                         ON DUPLICATE KEY UPDATE
                         message_count = message_count + %s,
-                        agents_used = JSON_MERGE_PATCH(agents_used, %s)
+                        insight_count = insight_count + 1,
+                        agents_used = JSON_MERGE_PATCH(COALESCE(agents_used, '[]'), %s)
                     """
                     agents_json = json.dumps([request.agentId])
                     cursor.execute(session_sql, (
@@ -829,48 +904,327 @@ async def peaje_ingest(request: PeajeIngestRequest):
                         agents_json
                     ))
                     
-                    conn.commit()
-                    insight_id = cursor.lastrowid
+                    # ═══ STEP 5: Log extraction audit trail ═══
+                    log_sql = """
+                        INSERT INTO peaje_extraction_log
+                        (insight_id, tenant_id, session_id, extraction_model, extraction_duration_ms,
+                         pii_items_scrubbed, pii_types_found, extraction_status, category_validated,
+                         original_category, input_message_count, input_char_count, conversation_hash)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    """
+                    cursor.execute(log_sql, (
+                        insight_id,
+                        request.tenantId,
+                        request.sessionId,
+                        extraction_model,
+                        extraction_duration_ms,
+                        scrub_result["total_pii_scrubbed"],
+                        json.dumps(scrub_result["pii_counts"]),
+                        "success",
+                        scrub_result["category_was_valid"],
+                        scrub_result["original_category"],
+                        len(request.messages),
+                        len(conversation_text),
+                        conversation_hash
+                    ))
                     
-                print(f"[EL PEAJE] ✓ Insight saved to database, ID: {insight_id}")
+                    conn.commit()
+                    
+                print(f"[EL PEAJE v2] ✓ Insight saved ID:{insight_id} | "
+                      f"PII:{scrub_result['total_pii_scrubbed']} | "
+                      f"Cat:{scrub_result['validated_category']} | "
+                      f"{extraction_duration_ms}ms")
                 
                 return {
                     "status": "ingested",
+                    "version": "v2.0",
                     "tenant": request.tenantId,
                     "insight_id": insight_id,
-                    "category": insight_data["category"],
+                    "category": scrub_result["validated_category"],
+                    "sub_category": scrub_result["sub_category"],
+                    "industry_vertical": scrub_result["industry_vertical"],
                     "sentiment": insight_data["sentiment"],
+                    "confidence_score": insight_data["confidence_score"],
+                    "pii_scrubbed": scrub_result["pii_scrubbed"],
+                    "pii_items_removed": scrub_result["total_pii_scrubbed"],
+                    "category_validated": scrub_result["category_was_valid"],
+                    "extraction_ms": extraction_duration_ms,
                     "timestamp": datetime.now().isoformat()
                 }
                 
             except Exception as db_error:
                 conn.rollback()
-                print(f"[EL PEAJE DB ERROR] {db_error}")
-                # Return success anyway - don't break the chat flow
+                print(f"[EL PEAJE v2 DB ERROR] {db_error}")
                 return {
                     "status": "logged_only",
                     "tenant": request.tenantId,
                     "error": str(db_error),
-                    "category": insight_data["category"],
+                    "category": scrub_result["validated_category"],
                     "sentiment": insight_data["sentiment"]
                 }
             finally:
                 conn.close()
         else:
-            # Database not available, just log
-            print(f"[EL PEAJE] Database not available, logged only")
+            print(f"[EL PEAJE v2] Database not available, logged only")
             return {
                 "status": "logged_only",
                 "tenant": request.tenantId,
-                "category": insight_data["category"],
+                "category": scrub_result["validated_category"],
                 "sentiment": insight_data["sentiment"],
                 "note": "Database connection not available"
             }
             
     except Exception as e:
-        # Don't fail the chat if Peaje ingestion fails
-        print(f"[EL PEAJE ERROR] {e}")
+        print(f"[EL PEAJE v2 ERROR] {e}")
         return {"status": "error", "message": str(e)}
+
+
+# ═══════════════════════════════════════════════════════════════
+# DEBATE INGESTION — v2.0
+# Debates are the richest source of strategic intelligence.
+# This endpoint processes debate transcripts into the Peaje.
+# ═══════════════════════════════════════════════════════════════
+
+class PeajeDebateIngestRequest(BaseModel):
+    tenantId: str
+    sessionId: str
+    agentA: str
+    agentB: str
+    topic: str
+    transcript: List[Dict[str, Any]]
+    synthesis: str
+
+@app.post("/peaje/ingest-debate")
+async def peaje_ingest_debate(request: PeajeDebateIngestRequest):
+    """Ingest a debate transcript into the Peaje — extracts multiple insights from the rich strategic content."""
+    try:
+        print(f"[EL PEAJE v2 DEBATE] Processing debate: {request.agentA} vs {request.agentB} on '{request.topic[:40]}...'")
+        
+        insights_saved = 0
+        errors = []
+        
+        # Process each turn of the debate as a separate insight
+        for i, turn in enumerate(request.transcript):
+            try:
+                turn_content = turn.get("content", "")
+                turn_agent = turn.get("agent", "debate_judge")
+                
+                if not turn_content or len(turn_content) < 20:
+                    continue
+                
+                # Build a synthetic message list for the extractor
+                synthetic_messages = [
+                    ChatMessage(role="user", content=f"DEBATE TOPIC: {request.topic}"),
+                    ChatMessage(role="assistant", content=turn_content),
+                ]
+                
+                # Extract insight from this turn
+                insight_data = await extract_insight_data_async(synthetic_messages, turn_content, request.tenantId)
+                
+                # PII Scrub
+                scrub_result = full_scrub_pipeline(
+                    insight_text=insight_data["insight_text"],
+                    raw_category=insight_data["category"],
+                    conversation_text=turn_content,
+                )
+                
+                # Save to database
+                conn = get_db_connection()
+                if conn:
+                    try:
+                        conversation_hash = hashlib.sha256(f"{request.sessionId}:turn{i}:{turn_content[:100]}".encode()).hexdigest()
+                        anonymized_hash = hashlib.sha256(f"{request.tenantId}:{request.sessionId}:debate:{i}".encode()).hexdigest()
+                        
+                        with conn.cursor() as cursor:
+                            cursor.execute("""
+                                INSERT INTO peaje_insights 
+                                (tenant_id, session_id, agent_id, insight_text, 
+                                 category, sub_category, industry_vertical,
+                                 sentiment, confidence_score, extraction_model, pii_scrubbed,
+                                 source_type, debate_turn, anonymized_hash, raw_conversation_hash)
+                                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                            """, (
+                                request.tenantId,
+                                request.sessionId,
+                                turn_agent,
+                                scrub_result["scrubbed_text"],
+                                scrub_result["validated_category"],
+                                scrub_result["sub_category"],
+                                scrub_result["industry_vertical"],
+                                insight_data["sentiment"],
+                                insight_data["confidence_score"],
+                                "minimax/minimax-m2.5",
+                                scrub_result["pii_scrubbed"],
+                                "debate",
+                                i + 1,
+                                anonymized_hash,
+                                conversation_hash
+                            ))
+                            
+                            # Update session as debate
+                            cursor.execute("""
+                                INSERT INTO peaje_sessions 
+                                (tenant_id, session_id, message_count, insight_count, agents_used, source, debate_mode)
+                                VALUES (%s, %s, 1, 1, %s, 'standalone', TRUE)
+                                ON DUPLICATE KEY UPDATE
+                                    message_count = message_count + 1,
+                                    insight_count = insight_count + 1,
+                                    debate_mode = TRUE
+                            """, (
+                                request.tenantId,
+                                request.sessionId,
+                                json.dumps([request.agentA, request.agentB]),
+                            ))
+                        
+                        conn.commit()
+                        insights_saved += 1
+                    except Exception as db_err:
+                        errors.append(f"Turn {i}: {str(db_err)}")
+                    finally:
+                        conn.close()
+                        
+            except Exception as turn_err:
+                errors.append(f"Turn {i}: {str(turn_err)}")
+        
+        # Also extract an insight from the judge's synthesis
+        if request.synthesis and len(request.synthesis) > 20:
+            try:
+                synth_messages = [
+                    ChatMessage(role="user", content=f"DEBATE SYNTHESIS: {request.topic}"),
+                    ChatMessage(role="assistant", content=request.synthesis),
+                ]
+                synth_data = await extract_insight_data_async(synth_messages, request.synthesis, request.tenantId)
+                synth_scrub = full_scrub_pipeline(
+                    insight_text=synth_data["insight_text"],
+                    raw_category=synth_data["category"],
+                    conversation_text=request.synthesis,
+                )
+                
+                conn = get_db_connection()
+                if conn:
+                    try:
+                        with conn.cursor() as cursor:
+                            cursor.execute("""
+                                INSERT INTO peaje_insights 
+                                (tenant_id, session_id, agent_id, insight_text, 
+                                 category, sub_category, industry_vertical,
+                                 sentiment, confidence_score, extraction_model, pii_scrubbed,
+                                 source_type, anonymized_hash, raw_conversation_hash)
+                                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                            """, (
+                                request.tenantId,
+                                request.sessionId,
+                                "debate_judge",
+                                synth_scrub["scrubbed_text"],
+                                synth_scrub["validated_category"],
+                                synth_scrub["sub_category"],
+                                synth_scrub["industry_vertical"],
+                                synth_data["sentiment"],
+                                min(synth_data["confidence_score"] + 0.10, 0.99),  # Synthesis gets confidence boost
+                                "minimax/minimax-m2.5",
+                                synth_scrub["pii_scrubbed"],
+                                "debate",
+                                hashlib.sha256(f"{request.tenantId}:{request.sessionId}:synthesis".encode()).hexdigest(),
+                                hashlib.sha256(request.synthesis[:200].encode()).hexdigest(),
+                            ))
+                        conn.commit()
+                        insights_saved += 1
+                    except Exception as synth_db_err:
+                        errors.append(f"Synthesis: {str(synth_db_err)}")
+                    finally:
+                        conn.close()
+            except Exception as synth_err:
+                errors.append(f"Synthesis: {str(synth_err)}")
+        
+        print(f"[EL PEAJE v2 DEBATE] ✓ {insights_saved} insights saved from debate | Errors: {len(errors)}")
+        
+        return {
+            "status": "ingested",
+            "version": "v2.0",
+            "source": "debate",
+            "tenant": request.tenantId,
+            "insights_saved": insights_saved,
+            "turns_processed": len(request.transcript),
+            "errors": errors[:5] if errors else [],
+            "timestamp": datetime.now().isoformat()
+        }
+        
+    except Exception as e:
+        print(f"[EL PEAJE v2 DEBATE ERROR] {e}")
+        return {"status": "error", "message": str(e)}
+
+
+# ═══════════════════════════════════════════════════════════════
+# PUNTO MEDIO ENDPOINTS — v2.0
+# ═══════════════════════════════════════════════════════════════
+
+@app.post("/punto-medio/consolidate")
+async def consolidate_endpoint():
+    """Trigger Punto Medio consolidation job.
+    In production, this should be called by a cron job every 6 hours.
+    Can also be triggered manually for immediate refresh."""
+    conn = get_db_connection()
+    if not conn:
+        raise HTTPException(status_code=503, detail="Database not available")
+    
+    try:
+        result = await consolidate_punto_medio(conn)
+        return result
+    finally:
+        conn.close()
+
+@app.get("/punto-medio/rag/{tenant_id}")
+async def get_rag_for_tenant(tenant_id: str):
+    """Get the dynamic RAG injection text for a specific tenant.
+    Shows what would be injected into system prompts.
+    Useful for debugging and transparency."""
+    conn = get_db_connection()
+    try:
+        rag = get_dynamic_rag(conn, tenant_id)
+        return {
+            "tenant_id": tenant_id,
+            "global_rag_length": len(rag["global_rag"]),
+            "tenant_rag_length": len(rag["tenant_rag"]),
+            "patterns_rag_length": len(rag["patterns_rag"]),
+            "combined_rag_length": len(rag["combined_rag"]),
+            "global_rag": rag["global_rag"],
+            "tenant_rag": rag["tenant_rag"],
+            "patterns_rag": rag["patterns_rag"],
+        }
+    finally:
+        if conn:
+            conn.close()
+
+
+# ═══════════════════════════════════════════════════════════════
+# PEAJE HEALTH & INSIGHTS ENDPOINTS — v2.0
+# ═══════════════════════════════════════════════════════════════
+
+@app.get("/peaje/health")
+async def peaje_health():
+    """Get health and statistics from the Peaje/Punto Medio system."""
+    conn = get_db_connection()
+    try:
+        stats = get_peaje_stats(conn)
+        return stats
+    finally:
+        if conn:
+            conn.close()
+
+@app.get("/peaje/insights/{tenant_id}")
+async def peaje_insights_for_tenant(tenant_id: str):
+    """Get insights summary for a specific tenant.
+    STRICT MULTI-TENANT ISOLATION: Only returns data for the specified tenant."""
+    conn = get_db_connection()
+    if not conn:
+        raise HTTPException(status_code=503, detail="Database not available")
+    
+    try:
+        summary = get_tenant_insights_summary(conn, tenant_id)
+        return summary
+    finally:
+        conn.close()
+
 
 # Legacy function - kept for compatibility
 async def extract_insight(messages: List[ChatMessage], response: str) -> Optional[dict]:
@@ -896,8 +1250,10 @@ async def health():
     return {
         "status": "healthy", 
         "service": "shift-cerebro-swarm-v3-legio-digitalis",
+        "version": "v2.0-punto-medio",
         "agents_count": len(AGENTS),
-        "agents": [info["name"] for info in AGENTS.values()]
+        "agents": [info["name"] for info in AGENTS.values()],
+        "features": ["dynamic_rag", "pii_scrubber", "taxonomy_validation", "debate_ingestion", "punto_medio"]
     }
 
 if __name__ == "__main__":
