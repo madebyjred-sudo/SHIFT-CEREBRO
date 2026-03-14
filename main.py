@@ -2,6 +2,7 @@ import os
 import json
 import hashlib
 import time
+import asyncio
 from datetime import datetime
 from typing import List, Optional, Annotated, TypedDict, Dict, Any
 from fastapi import FastAPI, HTTPException
@@ -457,6 +458,55 @@ INSTRUCCIONES:
         }
     return agent_node
 
+
+def create_async_agent_node(agent_id: str, model_name: str, tenant_id: str = "shift"):
+    """Async factory for debate agents — avoids blocking the event loop during LLM calls."""
+    async def agent_node_async(state: SwarmState):
+        agent_info = AGENTS[agent_id]
+        tid = str(tenant_id) if tenant_id is not None else "shift"
+        
+        # Dynamic RAG injection
+        try:
+            rag_conn = get_db_connection()
+            dynamic_rag = get_dynamic_rag(rag_conn, tid)
+            punto_medio_injection = dynamic_rag["combined_rag"]
+            if rag_conn:
+                rag_conn.close()
+        except Exception as rag_err:
+            print(f"[DYNAMIC RAG] Falling back to seed: {rag_err}")
+            punto_medio_injection = PUNTO_MEDIO_GLOBAL_RAG
+        
+        tenant_context = TENANT_CONTEXTS.get(tid, SEED_TENANT_CONTEXTS.get(tid, TENANT_CONTEXTS.get("shift", "")))
+        
+        system_content = f"""
+{SHIFT_LAB_CONTEXT}
+{tenant_context}
+{punto_medio_injection}
+
+TU ROL ACTUAL (ESPECIALISTA):
+{agent_info['skill']}
+
+INSTRUCCIONES:
+- Tienes acceso a herramientas: write_file_tool, read_file_tool, execute_command_tool, search_code_tool.
+- IMPORTANTE: Eres {agent_info['name']}, un especialista. Responde directamente al usuario de manera natural y profesional.
+- NO menciones el "swarm", "orquestador" ni que eres una IA multi-agente.
+- El usuario debe sentir que está hablando directamente con un consultor senior de {tid.upper()}.
+        """
+        
+        agent_llm = get_llm(model_name)
+        bound_llm = agent_llm.bind_tools(tools)
+        messages = [SystemMessage(content=system_content)] + state["messages"]
+        
+        # ✅ ASYNC invoke — does NOT block the event loop
+        response = await bound_llm.ainvoke(messages)
+        
+        return {
+            "messages": state["messages"] + [response],
+            "active_agent": agent_id,
+            "agent_outputs": {**state.get("agent_outputs", {}), agent_id: response.content}
+        }
+    return agent_node_async
+
 def determine_agent_from_message(message_content: str) -> str:
     """Orquestador simple que decide qué agente usar basado en el mensaje."""
     message_lower = message_content.lower()
@@ -483,192 +533,122 @@ def determine_agent_from_message(message_content: str) -> str:
 
 @app.post("/swarm/debate")
 async def swarm_debate(request: DebateDashboardRequest):
-    """Endpoint especial para orquestar un debate estructurado a través del Debate Dashboard.
+    """v3.0 — Simple JSON debate. No streaming. 3 agents, 1 response.
     
-    NOTA: Este endpoint ahora soporta streaming para evitar timeouts en CPanel/Railway.
-    El cliente debe usar NDJSON (Newline Delimited JSON) para recibir actualizaciones en tiempo real.
+    Architecture: Agent A → Agent B → Judge → Single JSON response.
+    Same pattern as /swarm/chat which is proven to work.
     """
-    
-    async def debate_generator():
-        """Generador asíncrono que produce eventos de streaming del debate."""
+    try:
+        # ═══ NORMALIZE AGENT IDS ═══
+        def norm(aid: str) -> str:
+            return aid.split(" ")[0].lower().strip("-_.").replace("í","i").replace("á","a").replace("ó","o").replace("ú","u")
+        
+        a_id = norm(request.agent_a_id)
+        b_id = norm(request.agent_b_id)
+        
+        # Pick model — allow any model in MODEL_MAP, default to Opus
+        safe_model = str(request.model) if request.model in MODEL_MAP else "Claude Opus 4.6"
+        tid = str(request.tenant_id or "shift")
+        
+        # Validate agents exist
+        if a_id not in AGENTS:
+            raise HTTPException(status_code=400, detail=f"Agente '{a_id}' no existe. Disponibles: {list(AGENTS.keys())}")
+        if b_id not in AGENTS:
+            raise HTTPException(status_code=400, detail=f"Agente '{b_id}' no existe. Disponibles: {list(AGENTS.keys())}")
+        
+        print(f"[DEBATE v3] {AGENTS[a_id]['name']} vs {AGENTS[b_id]['name']} | Topic: {request.topic[:50]}... | Model: {safe_model} | Turns: {request.turns}")
+        
+        # ═══ BUILD LLM ═══
+        debate_llm = get_llm(safe_model)
+        
+        # ═══ RAG CONTEXT ═══
         try:
-            agent_a_id = request.agent_a_id
-            agent_b_id = request.agent_b_id
+            rag_conn = get_db_connection()
+            dynamic_rag = get_dynamic_rag(rag_conn, tid)
+            rag_text = dynamic_rag["combined_rag"]
+            if rag_conn: rag_conn.close()
+        except Exception:
+            rag_text = PUNTO_MEDIO_GLOBAL_RAG
+        
+        tenant_ctx = TENANT_CONTEXTS.get(tid, SEED_TENANT_CONTEXTS.get(tid, TENANT_CONTEXTS.get("shift", "")))
+        
+        # ═══ AGENT SYSTEM PROMPTS ═══
+        def build_system(agent_id: str, soul: str = "") -> str:
+            info = AGENTS[agent_id]
+            base = f"""{SHIFT_LAB_CONTEXT}\n{tenant_ctx}\n{rag_text}\n\nTU ROL: {info['skill']}\n\nINSTRUCCIONES:\n- Eres {info['name']}, consultor senior de {tid.upper()}.\n- Argumenta con datos, frameworks y ejemplos concretos.\n- Sé directo, estratégico y accionable."""
+            if soul:
+                base += f"\n\nDIRECTIVA ESPECIAL DEL USUARIO PARA TI:\n{soul}"
+            return base
+        
+        sys_a = build_system(a_id, request.soul_a or "")
+        sys_b = build_system(b_id, request.soul_b or "")
+        
+        # ═══ DEBATE LOOP ═══
+        transcript = []
+        context_thread = f"TEMA: {request.topic}\nOBJETIVO/OUTPUT ESPERADO: {request.expected_output}"
+        
+        for turn in range(1, request.turns + 1):
+            print(f"[DEBATE v3] Turn {turn}/{request.turns} — Agent A: {a_id}")
             
-            # In case the frontend passes the display name like 'Roberto - Finance' instead of 'roberto'
-            # we'll map it to the first word/token lowercased avoiding special chars
-            def unify_agent_id(aid: str) -> str:
-                val = aid.split(" ")[0].lower().strip("-_.")
-                # Map special cases if needed (e.g. maria vs maría inside dict)
-                val = val.replace("í", "i").replace("á", "a").replace("ó", "o")
-                return val
-
-            a_id = unify_agent_id(agent_a_id)
-            b_id = unify_agent_id(agent_b_id)
+            # Agent A argues
+            prompt_a = f"{context_thread}\n\n{'Responde al argumento anterior de tu contraparte y avanza hacia el OBJETIVO.' if turn > 1 else 'Presenta tu argumento inicial hacia el OBJETIVO.'}"
+            resp_a = await debate_llm.ainvoke([SystemMessage(content=sys_a), HumanMessage(content=prompt_a)])
+            text_a = resp_a.content if hasattr(resp_a, 'content') else str(resp_a)
+            transcript.append({"turn": turn, "agent": a_id, "agent_name": AGENTS[a_id]["name"], "side": "A", "content": text_a})
             
-            # Enforce PRO model for Debate 
-            # Fallback to Opus 4.6 if the model provided is somehow not a PRO model
-            pro_models = ["Gemini 3.1 Pro", "Claude Opus 4.6", "Moonshot Kimi K2.5"]
-            safe_model = str(request.model) if request.model in pro_models else "Claude Opus 4.6"
-
-            # Validate agents
-            if a_id not in AGENTS or b_id not in AGENTS:
-                yield json.dumps({"error": f"Agente seleccionado no existe: {a_id} o {b_id}"}) + "\n"
-                return
-                
-            print(f"[DEBATE STREAM] Iniciando Arena: {a_id} vs {b_id} sobre '{request.topic[:30]}...' con modelo PRO: {safe_model}")
-
-            # Helper to extract content safely
-            def get_message_content(messages_list: List[Any]) -> str:
-                if not messages_list: return ""
-                last_msg = messages_list[-1]
-                return str(last_msg.content) if hasattr(last_msg, 'content') else str(last_msg)
-
-            # Transcript history
-            transcript: List[Dict[str, Any]] = []
+            print(f"[DEBATE v3] Turn {turn}/{request.turns} — Agent B: {b_id}")
             
-            # Tema inicial
-            current_context = f"TEMA DE DEBATE: {request.topic}\nOBJETIVO ESPERADO: {request.expected_output}"
-
-            # Enviar evento de inicio
-            yield json.dumps({
-                "type": "start",
-                "agent_a": AGENTS[a_id]["name"],
-                "agent_b": AGENTS[b_id]["name"],
-                "turns": request.turns
-            }) + "\n"
-
-            # Loop de debate (X turnos)
-            for turn in range(request.turns):
-                print(f"[DEBATE STREAM] Ejecutando Turno {turn + 1}/{request.turns}")
-                
-                # --- TURNO DEL AGENTE A ---
-                yield json.dumps({
-                    "type": "turn_start",
-                    "turn": turn + 1,
-                    "agent": AGENTS[a_id]["name"],
-                    "side": "A"
-                }) + "\n"
-                
-                # Preparamos el contexto para A
-                messages_a = [HumanMessage(content=current_context)]
-                if request.soul_a:
-                    messages_a.insert(0, SystemMessage(content=f"INYECCIÓN DE ALMA (SOUL) PARA TI:\n{request.soul_a}"))
-                
-                node_a = create_agent_node_with_model(a_id, safe_model, str(request.tenant_id))
-                state_a: SwarmState = {"messages": messages_a, "context": "", "active_agent": a_id, "agent_outputs": {}}
-                result_a = node_a(state_a)
-                resp_a = get_message_content(result_a["messages"])
-                
-                transcript.append({
-                    "agent": a_id,
-                    "role": AGENTS[a_id]["name"],
-                    "content": resp_a
-                })
-                
-                # Enviar respuesta de A
-                yield json.dumps({
-                    "type": "turn_complete",
-                    "turn": turn + 1,
-                    "agent": AGENTS[a_id]["name"],
-                    "side": "A",
-                    "content": resp_a
-                }) + "\n"
-                
-                # --- TURNO DEL AGENTE B ---
-                yield json.dumps({
-                    "type": "turn_start",
-                    "turn": turn + 1,
-                    "agent": AGENTS[b_id]["name"],
-                    "side": "B"
-                }) + "\n"
-                
-                # El Agente B responde a lo que dijo el Agente A sobre el tema central
-                turn_b_context = f"{current_context}\n\nARGUMENTO DE TU CONTRAPARTE ({AGENTS[a_id]['name']}):\n{resp_a}\n\nRefuta o construye sobre esto para alcanzar el OBJETIVO."
-                messages_b = [HumanMessage(content=turn_b_context)]
-                if request.soul_b:
-                    messages_b.insert(0, SystemMessage(content=f"INYECCIÓN DE ALMA (SOUL) PARA TI:\n{request.soul_b}"))
-                    
-                node_b = create_agent_node_with_model(b_id, safe_model, str(request.tenant_id))
-                state_b: SwarmState = {"messages": messages_b, "context": "", "active_agent": b_id, "agent_outputs": {}}
-                result_b = node_b(state_b)
-                resp_b = get_message_content(result_b["messages"])
-                
-                transcript.append({
-                    "agent": b_id,
-                    "role": AGENTS[b_id]["name"],
-                    "content": resp_b
-                })
-                
-                # Enviar respuesta de B
-                yield json.dumps({
-                    "type": "turn_complete",
-                    "turn": turn + 1,
-                    "agent": AGENTS[b_id]["name"],
-                    "side": "B",
-                    "content": resp_b
-                }) + "\n"
-                
-                # El próximo turno de A se basará en la respuesta de B
-                current_context = f"{current_context}\n\nÚLTIMA RESPUESTA DE TU CONTRAPARTE ({AGENTS[b_id]['name']}):\n{resp_b}\n\nTu turno de responder para alcanzar el OBJETIVO."
-                
-            print("[DEBATE STREAM] Debate finalizado. Iniciando Síntesis del Juez.")
+            # Agent B responds to A
+            prompt_b = f"{context_thread}\n\nARGUMENTO DE {AGENTS[a_id]['name']}:\n{text_a}\n\nRefuta, complementa o construye sobre esto para alcanzar el OBJETIVO."
+            resp_b = await debate_llm.ainvoke([SystemMessage(content=sys_b), HumanMessage(content=prompt_b)])
+            text_b = resp_b.content if hasattr(resp_b, 'content') else str(resp_b)
+            transcript.append({"turn": turn, "agent": b_id, "agent_name": AGENTS[b_id]["name"], "side": "B", "content": text_b})
             
-            # --- Síntesis Crítica (El Juez) ---
-            yield json.dumps({
-                "type": "judging",
-                "message": "El Juez está sintetizando los argumentos..."
-            }) + "\n"
-            
-            # Formatear el transcript para el juez
-            transcript_text = "\n\n".join([f"--- [TURNO: {str(item['role']).upper()}] ---\n{item['content']}" for item in transcript])
-            
-            synthesis_llm = get_llm(safe_model)
-            synthesis_prompt = f"""
-{PUNTO_MEDIO_GLOBAL_RAG}
+            # Update context thread for next round
+            context_thread += f"\n\n[TURNO {turn} - {AGENTS[a_id]['name']}]: {text_a}\n[TURNO {turn} - {AGENTS[b_id]['name']}]: {text_b}"
+        
+        # ═══ JUDGE SYNTHESIS ═══
+        print(f"[DEBATE v3] Judge synthesizing...")
+        
+        transcript_md = "\n\n".join([f"### Turno {t['turn']} — {t['agent_name']} (Lado {t['side']})\n{t['content']}" for t in transcript])
+        
+        judge_prompt = f"""{rag_text}
 
-Eres el 'Juez Supremo de Arena' de Shifty Studio. Se acaba de llevar a cabo un encarnizado debate entre {AGENTS[a_id]['name']} y {AGENTS[b_id]['name']}.
+Eres el Juez Estratégico de Shifty Studio Arena. Acabas de presenciar un debate entre **{AGENTS[a_id]['name']}** y **{AGENTS[b_id]['name']}**.
 
-TEMA DEL DEBATE: {request.topic}
-OUTPUT ESPERADO POR EL USUARIO: {request.expected_output}
+**TEMA:** {request.topic}
+**OUTPUT ESPERADO:** {request.expected_output}
 
-TRANSCRIPCIÓN COMPLETA DEL DEBATE:
-{transcript_text}
+**TRANSCRIPCIÓN:**
+{transcript_md}
 
-Tu tarea es evaluar los argumentos presentados y generar EL OUTPUT FINAL directamente, cumpliendo exactamente con las expectativas del usuario.
-1. Analiza con agudeza los puntos fuertes que cada especialista aportó.
-2. Si hubo contradicciones, toma una postura firme justificando por qué.
-3. El formato de tu respuesta DEBE ser el 'OUTPUT ESPERADO' que pidió el ejecutivo.
-4. Redacta de forma magistral, consultora nivel McKinsey/BCG, entregando un plan, solución o respuesta accionable, lista para ejecutarse.
-            """
-            final_resp = synthesis_llm.invoke([SystemMessage(content=synthesis_prompt)])
-            
-            # Enviar resultado final
-            yield json.dumps({
-                "type": "complete",
-                "content": final_resp.content,
-                "transcript": transcript,
-                "agent_active": "debate_judge",
-                "debate_participants": [a_id, b_id]
-            }) + "\n"
-            
-        except Exception as e:
-            import traceback
-            traceback.print_exc()
-            yield json.dumps({
-                "type": "error",
-                "error": str(e)
-            }) + "\n"
-
-    # Retornar respuesta streaming con NDJSON
-    return StreamingResponse(
-        debate_generator(),
-        media_type="application/x-ndjson",
-        headers={
-            "X-Accel-Buffering": "no",  # Deshabilitar buffering de nginx
-            "Cache-Control": "no-cache",
+**TU MISIÓN:**
+1. Evalúa los argumentos con rigor — identifica los puntos más fuertes de cada lado.
+2. Donde haya contradicciones, toma postura firme con justificación.
+3. Genera DIRECTAMENTE el output que pidió el usuario en el formato esperado.
+4. Nivel consultoría estratégica (McKinsey/BCG) — accionable, listo para ejecutar.
+5. Si aplica, incluye: recomendaciones priorizadas, riesgos identificados, próximos pasos concretos."""
+        
+        judge_resp = await debate_llm.ainvoke([SystemMessage(content=judge_prompt)])
+        synthesis = judge_resp.content if hasattr(judge_resp, 'content') else str(judge_resp)
+        
+        print(f"[DEBATE v3] ✓ Complete. Transcript: {len(transcript)} entries, Synthesis: {len(synthesis)} chars")
+        
+        return {
+            "content": synthesis,
+            "transcript": transcript,
+            "agent_active": "debate_judge",
+            "debate_participants": [a_id, b_id],
+            "model_used": safe_model,
+            "turns_completed": request.turns
         }
-    )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Error en debate: {str(e)}")
 
 @app.post("/swarm/chat")
 async def swarm_chat(request: ChatRequest):
