@@ -28,6 +28,9 @@ import os
 import json
 from datetime import datetime
 from typing import Dict, List, Optional
+from langchain_core.messages import SystemMessage, HumanMessage
+
+CONSOLIDATION_WINDOW_DAYS = int(os.getenv("CONSOLIDATION_WINDOW_DAYS", "90"))
 
 # ═══════════════════════════════════════════════════════════════
 # FALLBACK RAG — Used when database has insufficient data
@@ -101,7 +104,7 @@ async def consolidate_punto_medio(conn, llm_func=None) -> Dict:
         with conn.cursor() as cursor:
             # ─── PHASE 1: GLOBAL CONSOLIDATION (cross-tenant, anonymized) ───
             # Group insights by category across all tenants
-            cursor.execute("""
+            cursor.execute(f"""
                 SELECT 
                     category,
                     industry_vertical,
@@ -114,7 +117,7 @@ async def consolidate_punto_medio(conn, llm_func=None) -> Dict:
                         SEPARATOR ' ||| '
                     ) as sample_insights
                 FROM peaje_insights
-                WHERE created_at >= DATE_SUB(NOW(), INTERVAL 30 DAY)
+                WHERE created_at >= DATE_SUB(NOW(), INTERVAL {CONSOLIDATION_WINDOW_DAYS} DAY)
                   AND pii_scrubbed = TRUE
                   AND confidence_score >= 0.30
                 GROUP BY category, industry_vertical
@@ -125,12 +128,13 @@ async def consolidate_punto_medio(conn, llm_func=None) -> Dict:
             global_groups = cursor.fetchall()
             
             for group in global_groups:
-                consolidated_text = _synthesize_consolidation(
+                consolidated_text = await _synthesize_consolidation_async(
                     group["sample_insights"],
                     group["category"],
                     group["industry_vertical"],
                     group["insight_count"],
                     group["tenant_count"],
+                    llm_func=llm_func
                 )
                 
                 executive_brief = consolidated_text[:200] if consolidated_text else None
@@ -141,10 +145,10 @@ async def consolidate_punto_medio(conn, llm_func=None) -> Dict:
                     (scope, tenant_id, category, industry_vertical, region,
                      consolidated_text, executive_brief,
                      source_insight_count, contributing_tenants, confidence_score,
-                     is_active, version, last_consolidated_at)
+                     is_active, approval_status, version, last_consolidated_at)
                     VALUES ('global', NULL, %s, %s, 'LATAM',
                             %s, %s, %s, %s, %s,
-                            TRUE, 1, NOW())
+                            TRUE, 'pending', 1, NOW())
                     ON DUPLICATE KEY UPDATE
                         consolidated_text = VALUES(consolidated_text),
                         executive_brief = VALUES(executive_brief),
@@ -176,7 +180,7 @@ async def consolidate_punto_medio(conn, llm_func=None) -> Dict:
             for tenant in active_tenants:
                 tid = tenant["tenant_id"]
                 
-                cursor.execute("""
+                cursor.execute(f"""
                     SELECT 
                         category,
                         COUNT(*) as insight_count,
@@ -188,7 +192,7 @@ async def consolidate_punto_medio(conn, llm_func=None) -> Dict:
                         ) as sample_insights
                     FROM peaje_insights
                     WHERE tenant_id = %s
-                      AND created_at >= DATE_SUB(NOW(), INTERVAL 30 DAY)
+                      AND created_at >= DATE_SUB(NOW(), INTERVAL {CONSOLIDATION_WINDOW_DAYS} DAY)
                       AND confidence_score >= 0.20
                     GROUP BY category
                     HAVING insight_count >= 2
@@ -198,12 +202,13 @@ async def consolidate_punto_medio(conn, llm_func=None) -> Dict:
                 tenant_groups = cursor.fetchall()
                 
                 for group in tenant_groups:
-                    consolidated_text = _synthesize_consolidation(
+                    consolidated_text = await _synthesize_consolidation_async(
                         group["sample_insights"],
                         group["category"],
                         tenant["industry_vertical"],
                         group["insight_count"],
                         1,  # single tenant
+                        llm_func=llm_func
                     )
                     
                     executive_brief = consolidated_text[:200] if consolidated_text else None
@@ -213,10 +218,10 @@ async def consolidate_punto_medio(conn, llm_func=None) -> Dict:
                         (scope, tenant_id, category, industry_vertical, region,
                          consolidated_text, executive_brief,
                          source_insight_count, contributing_tenants, confidence_score,
-                         is_active, version, last_consolidated_at)
+                         is_active, approval_status, version, last_consolidated_at)
                         VALUES ('tenant', %s, %s, %s, 'LATAM',
                                 %s, %s, %s, 1, %s,
-                                TRUE, 1, NOW())
+                                TRUE, 'pending', 1, NOW())
                         ON DUPLICATE KEY UPDATE
                             consolidated_text = VALUES(consolidated_text),
                             executive_brief = VALUES(executive_brief),
@@ -237,7 +242,7 @@ async def consolidate_punto_medio(conn, llm_func=None) -> Dict:
             
             # ─── PHASE 3: UPDATE PATTERNS TABLE ───
             # Promote high-frequency insights into patterns
-            cursor.execute("""
+            cursor.execute(f"""
                 SELECT 
                     category,
                     industry_vertical,
@@ -247,7 +252,7 @@ async def consolidate_punto_medio(conn, llm_func=None) -> Dict:
                     GROUP_CONCAT(DISTINCT tenant_id) as tenants,
                     GROUP_CONCAT(DISTINCT agent_id) as agents
                 FROM peaje_insights
-                WHERE created_at >= DATE_SUB(NOW(), INTERVAL 30 DAY)
+                WHERE created_at >= DATE_SUB(NOW(), INTERVAL {CONSOLIDATION_WINDOW_DAYS} DAY)
                   AND confidence_score >= 0.50
                 GROUP BY category, industry_vertical, LEFT(insight_text, 100)
                 HAVING frequency >= 3
@@ -263,8 +268,8 @@ async def consolidate_punto_medio(conn, llm_func=None) -> Dict:
                     INSERT INTO peaje_patterns 
                     (pattern_type, category, pattern_text, industry_vertical, region,
                      occurrence_count, source_insight_count, confidence_score, 
-                     is_active, related_agents)
-                    VALUES (%s, %s, %s, %s, 'LATAM', %s, %s, %s, TRUE, %s)
+                     is_active, approval_status, related_agents)
+                    VALUES (%s, %s, %s, %s, 'LATAM', %s, %s, %s, TRUE, 'pending', %s)
                     ON DUPLICATE KEY UPDATE
                         occurrence_count = occurrence_count + VALUES(occurrence_count),
                         source_insight_count = source_insight_count + VALUES(source_insight_count),
@@ -320,28 +325,64 @@ async def consolidate_punto_medio(conn, llm_func=None) -> Dict:
     return results
 
 
-def _synthesize_consolidation(
+async def _synthesize_consolidation_async(
     sample_insights: str,
     category: str,
     industry: str,
     count: int,
     tenant_count: int,
+    llm_func=None,
 ) -> str:
     """
     Synthesize a consolidated text from grouped insights.
     
-    For now, uses deterministic aggregation (no LLM call).
-    This keeps costs at $0 and avoids circular dependencies.
-    In Phase 2+, we can optionally use an LLM for richer synthesis.
+    If llm_func is provided, it uses the LLM to write a high-density, 
+    strategic 1-2 sentence executive summary.
+    Otherwise, it falls back to deterministic aggregation.
     """
     if not sample_insights:
         return f"Patrón emergente en {category} — {count} señales detectadas."
-    
-    # Split the concatenated samples
-    samples = [s.strip() for s in sample_insights.split("|||") if s.strip()]
-    
+
     cat_label = CATEGORY_LABELS.get(category, category)
     industry_label = industry or "Multi-vertical"
+
+    # Option A: LLM Synthesis (Minimax/OpenRouter)
+    if llm_func:
+        try:
+            prompt = f"""
+            Como estratega senior de Shifty Studio, consolida estas señales en una única síntesis de ALTA DENSIDAD.
+            
+            CATEGORÍA: {cat_label}
+            INDUSTRIA: {industry_label}
+            SEÑALES DETECTADAS: {count}
+            FUENTES (TENANTS): {tenant_count}
+            
+            INSIGHTS CRUDOS (MUESTRA):
+            {sample_insights}
+            
+            INSTRUCCIÓN: Escribe un Resumen Ejecutivo Estratégico de exactamente 1 o 2 frases. 
+            Debe ser denso, sin relleno, y capturar la implicación de negocio.
+            No uses introducciones como "En base a las señales...". Ve directo al grano.
+            """
+            
+            if hasattr(llm_func, "ainvoke"):
+                response = await llm_func.ainvoke([
+                    SystemMessage(content="Eres un sintetizador de inteligencia corporativa de alta precisión."),
+                    HumanMessage(content=prompt)
+                ])
+                return response.content.strip()
+            elif callable(llm_func):
+                # If it's just a function, try calling it (assuming it returns a response object or string)
+                response = await llm_func(prompt)
+                return response.strip() if isinstance(response, str) else response.content.strip()
+                
+        except Exception as e:
+            print(f"[PUNTO MEDIO] Error in LLM synthesis: {e}")
+            # Fall back to deterministic logic below
+    
+    # Option B: Deterministic Fallback
+    # Split the concatenated samples
+    samples = [s.strip() for s in sample_insights.split("|||") if s.strip()]
     
     # Build consolidated text
     lines = [f"[{cat_label}] — {industry_label} ({count} señales, {tenant_count} fuentes)"]
@@ -399,6 +440,7 @@ def get_dynamic_rag(conn, tenant_id: str = "shift") -> Dict[str, str]:
                 FROM punto_medio_consolidated
                 WHERE scope = 'global' 
                   AND is_active = TRUE
+                  AND approval_status = 'approved'
                   AND (expires_at IS NULL OR expires_at > NOW())
                 ORDER BY confidence_score DESC, source_insight_count DESC
                 LIMIT 20
@@ -426,6 +468,7 @@ def get_dynamic_rag(conn, tenant_id: str = "shift") -> Dict[str, str]:
                 WHERE scope = 'tenant'
                   AND tenant_id = %s
                   AND is_active = TRUE
+                  AND approval_status = 'approved'
                   AND (expires_at IS NULL OR expires_at > NOW())
                 ORDER BY confidence_score DESC
                 LIMIT 10
@@ -448,6 +491,7 @@ def get_dynamic_rag(conn, tenant_id: str = "shift") -> Dict[str, str]:
                 FROM peaje_patterns p
                 LEFT JOIN peaje_pattern_tenants pt ON p.id = pt.pattern_id
                 WHERE p.is_active = TRUE 
+                  AND p.approval_status = 'approved'
                   AND p.occurrence_count >= 3
                   AND p.confidence_score >= 0.40
                 GROUP BY p.id

@@ -26,6 +26,16 @@ from punto_medio import (
     SEED_TENANT_CONTEXTS,
 )
 
+# ═══════════════════════════════════════════════════════════════
+# TENANT CONSTITUTION v2.0 — Contexto Corporativo Dinámico
+# ═══════════════════════════════════════════════════════════════
+from tenant_constitution import (
+    compile_tenant_context,
+    get_tenant_context_with_fallback,
+    upsert_tenant_constitution,
+)
+from tenant_api import router as tenant_router
+
 # MySQL Connection
 try:
     import pymysql
@@ -68,6 +78,11 @@ def get_db_connection():
         return None
 
 app = FastAPI(title="Shift Lab Swarm Cerebro v3 - Legio Digitalis Latina")
+
+# ═══════════════════════════════════════════════════════════════
+# MOUNT TENANT CONSTITUTION API v2.0
+# ═══════════════════════════════════════════════════════════════
+app.include_router(tenant_router)
 
 # Habilitar CORS - Configurable via environment variable
 ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "http://localhost:3000,http://localhost:3001,http://localhost:5173").split(",")
@@ -463,7 +478,8 @@ def create_agent_node_with_model(agent_id: str, model_name: str, tenant_id: str 
             punto_medio_injection = PUNTO_MEDIO_GLOBAL_RAG
         
         # Tenant context: try dynamic first, then hardcoded seed
-        tenant_context = TENANT_CONTEXTS.get(tid, SEED_TENANT_CONTEXTS.get(tid, TENANT_CONTEXTS.get("shift", "")))
+        # v2.0: Contexto dinámico desde DB con fallback a seeds
+        tenant_context = get_tenant_context_with_fallback(get_db_connection(), tid)
         
         # Get context from state (includes web search results if enabled)
         context_from_state = state.get("context", "")
@@ -976,12 +992,16 @@ TAXONOMÍA REQUERIDA (Elige la más relevante):
 - "Gaps de Productividad Institucional"
 - "Vectores de Aceleración Ocultos"
 
+FORMATO DE INSIGHT:
+El `insight_text` DEBE seguir este formato denso exactamente:
+'Observation: [X] | Impact: [Y] | Actionable Vector: [Z]'
+
 CONVERSACIÓN:
 {conversation_text}
 
 Debes responder ÚNICAMENTE con un JSON válido con esta estructura exacta:
 {{
-    "insight_text": "El resumen ejecutivo anonimizado (Entidad-Contexto-Valor).",
+    "insight_text": "Observation: ... | Impact: ... | Actionable Vector: ...",
     "category": "Una de las 4 taxonomías requeridas",
     "sentiment": "positive, negative, o neutral",
     "confidence_score": 0.95
@@ -1381,7 +1401,7 @@ async def consolidate_endpoint():
         raise HTTPException(status_code=503, detail="Database not available")
     
     try:
-        result = await consolidate_punto_medio(conn)
+        result = await consolidate_punto_medio(conn, llm_func=get_llm('minimax/minimax-m2.5'))
         return result
     finally:
         conn.close()
@@ -1435,6 +1455,148 @@ async def peaje_insights_for_tenant(tenant_id: str):
     try:
         summary = get_tenant_insights_summary(conn, tenant_id)
         return summary
+    finally:
+        conn.close()
+
+
+@app.get("/punto-medio/review")
+async def get_pending_reviews():
+    """Get all pending consolidations and patterns awaiting review.
+    Returns items that are 'grey' (pending) — not yet injected into RAG."""
+    conn = get_db_connection()
+    if not conn:
+        raise HTTPException(status_code=503, detail="Database not available")
+    
+    try:
+        with conn.cursor() as cursor:
+            # Pending consolidations
+            cursor.execute("""
+                SELECT id, scope, tenant_id, category, industry_vertical,
+                       consolidated_text, executive_brief,
+                       source_insight_count, contributing_tenants, confidence_score,
+                       approval_status, version, last_consolidated_at, created_at
+                FROM punto_medio_consolidated
+                WHERE approval_status = 'pending' AND is_active = TRUE
+                ORDER BY last_consolidated_at DESC
+            """)
+            pending_consolidations = cursor.fetchall()
+            
+            # Pending patterns
+            cursor.execute("""
+                SELECT id, pattern_type, category, pattern_text,
+                       industry_vertical, region, occurrence_count,
+                       source_insight_count, confidence_score,
+                       approval_status, first_seen_at, last_seen_at
+                FROM peaje_patterns
+                WHERE approval_status = 'pending' AND is_active = TRUE
+                ORDER BY last_seen_at DESC
+            """)
+            pending_patterns = cursor.fetchall()
+        
+        # Convert datetime objects for JSON serialization
+        for item in pending_consolidations + pending_patterns:
+            for key, val in item.items():
+                if hasattr(val, 'isoformat'):
+                    item[key] = val.isoformat()
+                elif isinstance(val, __import__('decimal').Decimal):
+                    item[key] = float(val)
+        
+        return {
+            "pending_consolidations": pending_consolidations,
+            "pending_consolidations_count": len(pending_consolidations),
+            "pending_patterns": pending_patterns,
+            "pending_patterns_count": len(pending_patterns),
+        }
+    finally:
+        conn.close()
+
+
+class ReviewAction(BaseModel):
+    action: str  # "approve" or "reject"
+    reviewed_by: str = "admin"
+    item_type: str = "consolidation"  # "consolidation" or "pattern"
+
+
+@app.patch("/punto-medio/review/{item_id}")
+async def review_item(item_id: int, review: ReviewAction):
+    """Approve or reject a pending consolidation or pattern.
+    Approved items become 'green' and get injected into live RAG.
+    Rejected items stay in DB but never get injected."""
+    if review.action not in ("approve", "reject"):
+        raise HTTPException(status_code=400, detail="action must be 'approve' or 'reject'")
+    
+    conn = get_db_connection()
+    if not conn:
+        raise HTTPException(status_code=503, detail="Database not available")
+    
+    new_status = "approved" if review.action == "approve" else "rejected"
+    
+    try:
+        with conn.cursor() as cursor:
+            if review.item_type == "consolidation":
+                cursor.execute("""
+                    UPDATE punto_medio_consolidated
+                    SET approval_status = %s, reviewed_by = %s, reviewed_at = NOW()
+                    WHERE id = %s
+                """, (new_status, review.reviewed_by, item_id))
+            elif review.item_type == "pattern":
+                cursor.execute("""
+                    UPDATE peaje_patterns
+                    SET approval_status = %s, reviewed_by = %s, reviewed_at = NOW()
+                    WHERE id = %s
+                """, (new_status, review.reviewed_by, item_id))
+            else:
+                raise HTTPException(status_code=400, detail="item_type must be 'consolidation' or 'pattern'")
+            
+            if cursor.rowcount == 0:
+                raise HTTPException(status_code=404, detail=f"Item {item_id} not found")
+            
+            conn.commit()
+        
+        return {
+            "status": "updated",
+            "item_id": item_id,
+            "item_type": review.item_type,
+            "new_status": new_status,
+            "reviewed_by": review.reviewed_by,
+            "timestamp": datetime.now().isoformat(),
+        }
+    finally:
+        conn.close()
+
+
+@app.post("/punto-medio/review/bulk")
+async def bulk_review(item_ids: List[int], action: str = "approve", reviewed_by: str = "admin", item_type: str = "consolidation"):
+    """Bulk approve or reject multiple items at once."""
+    if action not in ("approve", "reject"):
+        raise HTTPException(status_code=400, detail="action must be 'approve' or 'reject'")
+    
+    conn = get_db_connection()
+    if not conn:
+        raise HTTPException(status_code=503, detail="Database not available")
+    
+    new_status = "approved" if action == "approve" else "rejected"
+    
+    try:
+        with conn.cursor() as cursor:
+            table = "punto_medio_consolidated" if item_type == "consolidation" else "peaje_patterns"
+            placeholders = ", ".join(["%s"] * len(item_ids))
+            cursor.execute(f"""
+                UPDATE {table}
+                SET approval_status = %s, reviewed_by = %s, reviewed_at = NOW()
+                WHERE id IN ({placeholders})
+            """, [new_status, reviewed_by] + item_ids)
+            
+            updated = cursor.rowcount
+            conn.commit()
+        
+        return {
+            "status": "bulk_updated",
+            "updated_count": updated,
+            "action": action,
+            "reviewed_by": reviewed_by,
+            "timestamp": datetime.now().isoformat(),
+        }
     finally:
         conn.close()
 
