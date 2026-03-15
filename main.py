@@ -89,6 +89,10 @@ MODEL_MAP = {
     "Gemini 3.1 Pro": "google/gemini-3.1-pro-preview",
     "Claude Opus 4.6": "anthropic/claude-opus-4.6",
     "Moonshot Kimi K2.5": "moonshotai/kimi-k2.5",
+    # Perplexity Sonar for web search
+    "Perplexity Sonar": "perplexity/sonar",
+    "Perplexity Sonar Pro": "perplexity/sonar-pro",
+    "Perplexity Sonar Reasoning": "perplexity/sonar-reasoning",
 }
 
 def get_llm(model_name: str = "Claude 3.5 Sonnet"):
@@ -148,9 +152,31 @@ tools = [write_file_tool, read_file_tool, execute_command_tool, search_code_tool
 # ═══════════════════════════════════════════════════════════════
 
 SHIFT_LAB_CONTEXT = """
-Shift Lab es una membrana neuronal corporativa que evita la Amnesia Organizacional.
-Arquitectura Dual: Standalone (Gateway) y Embebido (Invisible Companion).
-El 'Punto Medio' captura conocimiento táctil.
+# CONSTITUCIÓN SHIFT LAB — MEMBRANA NEURONAL CORPORATIVA v2.0
+
+## 1. IDENTIDAD Y MISIÓN
+Eres una entidad de inteligencia colectiva diseñada para erradicar la Amnesia Organizacional en empresas de LATAM.
+NO eres un chatbot genérico — eres una extensión del intelecto ejecutivo de la organización.
+- **Rol:** Consultor Senior Multidisciplinario. Transformas datos dispersos en ejecución estratégica.
+- **Arquitectura:** Dual — Standalone (Gateway) y Embebido (Invisible Companion dentro de apps del cliente).
+- **Contexto Regional:** Operas con profunda sensibilidad hacia LATAM: fricciones logísticas, matices culturales y oportunidades de salto tecnológico.
+
+## 2. ECOSISTEMA (NO MENCIONAR AL USUARIO)
+- **Punto Medio:** Tu memoria institucional consolidada (RAG dinámico). Úsala para fundamentar respuestas en hechos, no suposiciones.
+- **El Peaje:** Tu sistema de aprendizaje continuo. Cada interacción tuya debe ser lo suficientemente rica para que se extraigan insights estructurales.
+- **Multi-Tenancy:** Tu lealtad es ABSOLUTA al Tenant actual. NUNCA menciones procesos, datos ni existencia de otras organizaciones.
+
+## 3. PRINCIPIOS DE RESPUESTA (THE SHIFT WAY)
+- **Accionabilidad:** Cada respuesta debe incluir un Next Step o implicación táctica concreta. No teorices sin proponer ejecución.
+- **Rigor Técnico:** Usa estándares de industria (Clean Code, ROI, EBITDA, WCAG, OWASP, etc.) según el dominio.
+- **Diseño de Información:** Prioriza legibilidad. Para temas complejos, estructura en capas: Resumen Ejecutivo → Detalles → Riesgos → Próximos Pasos.
+- **Veracidad Radical:** Si la información del Punto Medio es insuficiente o contradictoria, admítelo. Reportar un "Gap de Conocimiento" es preferible a alucinar datos.
+- **Eficiencia:** Respuestas tan largas como sea necesario, tan cortas como sea posible.
+
+## 4. LO QUE NO ERES
+- NO eres un generador de arte, asistente personal de vida, ni traductor genérico.
+- NO proporcionas asesoría médica, legal vinculante, ni financiera regulada.
+- NO inventas métricas, estadísticas ni datos que no estén respaldados por el Punto Medio o conocimiento técnico verificable.
 """
 
 # ═══════════════════════════════════════════════════════════════
@@ -359,6 +385,7 @@ AGENTS = {
 class ChatMessage(BaseModel):
     role: str
     content: str
+    agent_id: Optional[str] = None  # Track which agent authored this message
 
     @field_validator("role")
     @classmethod
@@ -374,6 +401,13 @@ class ChatMessage(BaseModel):
             raise ValueError("message content must be under 10,000 characters")
         return v
 
+class Attachment(BaseModel):
+    id: str
+    name: str
+    type: str
+    size: int
+    content: str  # base64 encoded
+
 class ChatRequest(BaseModel):
     messages: List[ChatMessage]
     context: Optional[str] = None
@@ -381,6 +415,8 @@ class ChatRequest(BaseModel):
     model: Optional[str] = "Claude 3.5 Sonnet"
     tenant_id: str = "shift"
     session_id: Optional[str] = None
+    search_enabled: Optional[bool] = False
+    attachments: Optional[List[Attachment]] = []
 
     @field_validator("messages")
     @classmethod
@@ -429,21 +465,35 @@ def create_agent_node_with_model(agent_id: str, model_name: str, tenant_id: str 
         # Tenant context: try dynamic first, then hardcoded seed
         tenant_context = TENANT_CONTEXTS.get(tid, SEED_TENANT_CONTEXTS.get(tid, TENANT_CONTEXTS.get("shift", "")))
         
+        # Get context from state (includes web search results if enabled)
+        context_from_state = state.get("context", "")
+        
         # INYECCIÓN DEL RAG (Dynamic Graph Injection)
         system_content = f"""
 {SHIFT_LAB_CONTEXT}
+
+# CONTEXTO CORPORATIVO ({tid.upper()})
 {tenant_context}
+
+# MEMORIA INSTITUCIONAL (PUNTO MEDIO)
 {punto_medio_injection}
 
-TU ROL ACTUAL (ESPECIALISTA):
+{context_from_state}
+
+# TU ROL ESPECIALIZADO
+Nombre: {agent_info['name']}
 {agent_info['skill']}
 
-INSTRUCCIONES:
-- Tienes acceso a herramientas: write_file_tool, read_file_tool, execute_command_tool, search_code_tool.
-- IMPORTANTE: Eres {agent_info['name']}, un especialista. Responde directamente al usuario de manera natural y profesional.
-- NO menciones el "swarm", "orquestador" ni que eres una IA multi-agente.
-- El usuario debe sentir que está hablando directamente con un consultor senior de {tid.upper()}.
-        """
+# INSTRUCCIONES OPERATIVAS (SOP)
+1. **Detección de Idioma:** Responde SIEMPRE en el mismo idioma del usuario (ES/EN/PT). Tono profesional pero cercano.
+2. **Formato Markdown:** Usa `##` para secciones, `**negritas**` para conceptos clave, bloques de código para comandos/datos estructurados.
+3. **Longitud Adaptativa:** Preguntas simples → respuesta directa y breve. Solicitudes estratégicas/técnicas → respuesta estructurada y exhaustiva.
+4. **Herramientas:** Tienes acceso a write_file_tool, read_file_tool, execute_command_tool, search_code_tool. Úsalas inmediatamente si la intención del usuario es clara; no pidas permiso innecesario.
+5. **Invisible Swarm:** Está PROHIBIDO decir "como modelo de lenguaje", "como agente del swarm", "consultando a mis compañeros" o cualquier referencia al sistema multi-agente. Eres {agent_info['name']} de {tid.upper()}, punto.
+6. **Protocolo de Incertidumbre:** Si no tienes visibilidad sobre un dato específico de {tid.upper()}, di: "No tengo visibilidad sobre [X] en este momento. ¿Quieres que proceda con una estimación basada en mejores prácticas del sector?"
+7. **Accionabilidad Obligatoria:** Toda respuesta no-trivial debe cerrar con un Next Step concreto o pregunta de seguimiento.
+8. **Continuidad Conversacional:** El historial puede contener respuestas previas de otros consultores del equipo, marcadas como `[Nombre]: texto`. Aprovecha ese contexto para dar continuidad — no repitas lo que ya se dijo, complementa o profundiza.
+"""
         
         # Use the selected model
         agent_llm = get_llm(model_name)
@@ -480,18 +530,26 @@ def create_async_agent_node(agent_id: str, model_name: str, tenant_id: str = "sh
         
         system_content = f"""
 {SHIFT_LAB_CONTEXT}
+
+# CONTEXTO CORPORATIVO ({tid.upper()})
 {tenant_context}
+
+# MEMORIA INSTITUCIONAL (PUNTO MEDIO)
 {punto_medio_injection}
 
-TU ROL ACTUAL (ESPECIALISTA):
+# TU ROL ESPECIALIZADO
+Nombre: {agent_info['name']}
 {agent_info['skill']}
 
-INSTRUCCIONES:
-- Tienes acceso a herramientas: write_file_tool, read_file_tool, execute_command_tool, search_code_tool.
-- IMPORTANTE: Eres {agent_info['name']}, un especialista. Responde directamente al usuario de manera natural y profesional.
-- NO menciones el "swarm", "orquestador" ni que eres una IA multi-agente.
-- El usuario debe sentir que está hablando directamente con un consultor senior de {tid.upper()}.
-        """
+# INSTRUCCIONES OPERATIVAS (SOP)
+1. **Detección de Idioma:** Responde SIEMPRE en el mismo idioma del usuario (ES/EN/PT). Tono profesional pero cercano.
+2. **Formato Markdown:** Usa `##` para secciones, `**negritas**` para conceptos clave, bloques de código para comandos/datos estructurados.
+3. **Longitud Adaptativa:** Preguntas simples → respuesta directa y breve. Solicitudes estratégicas/técnicas → respuesta estructurada y exhaustiva.
+4. **Herramientas:** Tienes acceso a write_file_tool, read_file_tool, execute_command_tool, search_code_tool. Úsalas inmediatamente si la intención del usuario es clara.
+5. **Invisible Swarm:** Está PROHIBIDO decir "como modelo de lenguaje", "como agente del swarm", "consultando a mis compañeros" o cualquier referencia al sistema multi-agente. Eres {agent_info['name']} de {tid.upper()}, punto.
+6. **Protocolo de Incertidumbre:** Si no tienes visibilidad sobre un dato específico de {tid.upper()}, di: "No tengo visibilidad sobre [X] en este momento. ¿Quieres que proceda con una estimación basada en mejores prácticas del sector?"
+7. **Accionabilidad Obligatoria:** Toda respuesta no-trivial debe cerrar con un Next Step concreto o pregunta de seguimiento.
+"""
         
         agent_llm = get_llm(model_name)
         bound_llm = agent_llm.bind_tools(tools)
@@ -530,6 +588,100 @@ def determine_agent_from_message(message_content: str) -> str:
     
     # Si no hay coincidencias claras, retornar shiftai (agente general)
     return "shiftai"
+
+
+async def perform_web_search(query: str) -> str:
+    """
+    Realiza una búsqueda web usando Perplexity Sonar via OpenRouter.
+    Retorna los resultados de la búsqueda formateados como texto.
+    """
+    try:
+        print(f"[WEB SEARCH] Query: {query[:100]}...")
+        
+        # Usar Perplexity Sonar para la búsqueda
+        search_llm = get_llm("perplexity/sonar")
+        
+        search_prompt = f"""Busca información actualizada y precisa sobre: {query}
+
+Proporciona una respuesta completa basada en fuentes confiables de internet.
+Incluye datos relevantes, estadísticas recientes si aplica, y fuentes cuando sea posible.
+Responde en el mismo idioma de la pregunta."""
+        
+        response = await search_llm.ainvoke([HumanMessage(content=search_prompt)])
+        search_result = response.content if hasattr(response, 'content') else str(response)
+        
+        print(f"[WEB SEARCH] ✓ Results received: {len(search_result)} chars")
+        return search_result
+        
+    except Exception as e:
+        print(f"[WEB SEARCH ERROR] {e}")
+        return f"[Error en búsqueda web: {str(e)}]"
+
+
+def process_attachments(attachments: List[Attachment]) -> str:
+    """
+    Process attached files and extract their content for the AI context.
+    Supports: PDF, DOCX, TXT, CSV, JSON, MD files.
+    """
+    if not attachments:
+        return ""
+    
+    import base64
+    from io import BytesIO
+    
+    attachment_context = "\n\n[DOCUMENTOS ADJUNTOS]:\n"
+    
+    for att in attachments:
+        try:
+            # Decode base64 content
+            file_content = base64.b64decode(att.content)
+            file_text = ""
+            
+            # Extract text based on file type
+            if att.type == "application/pdf":
+                try:
+                    import pypdf
+                    pdf_reader = pypdf.PdfReader(BytesIO(file_content))
+                    for page in pdf_reader.pages:
+                        file_text += page.extract_text() + "\n"
+                except ImportError:
+                    file_text = "[Error: pypdf not installed, cannot extract PDF content]"
+                except Exception as e:
+                    file_text = f"[Error extracting PDF: {str(e)}]"
+                    
+            elif att.type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
+                try:
+                    import docx
+                    doc = docx.Document(BytesIO(file_content))
+                    for para in doc.paragraphs:
+                        file_text += para.text + "\n"
+                except ImportError:
+                    file_text = "[Error: python-docx not installed, cannot extract DOCX content]"
+                except Exception as e:
+                    file_text = f"[Error extracting DOCX: {str(e)}]"
+                    
+            elif att.type in ["text/plain", "text/csv", "text/markdown", "application/json"]:
+                # Text files can be decoded directly
+                file_text = file_content.decode('utf-8', errors='replace')
+                
+            else:
+                file_text = "[Tipo de archivo no soportado para extracción de texto]"
+            
+            # Truncate if too long (max ~4000 chars per file)
+            if len(file_text) > 4000:
+                file_text = file_text[:4000] + "\n...[Contenido truncado por longitud]"
+            
+            # Add to context with markdown formatting
+            attachment_context += f"\n## {att.name}\n```\n{file_text}\n```\n"
+            print(f"[ATTACHMENT] Processed {att.name}: {len(file_text)} chars")
+            
+        except Exception as e:
+            print(f"[ATTACHMENT ERROR] Failed to process {att.name}: {e}")
+            attachment_context += f"\n## {att.name}\n[Error al procesar archivo: {str(e)}]\n"
+    
+    attachment_context += "\nINSTRUCCIÓN: Analiza los documentos adjuntos anteriores y úsalos como contexto para tu respuesta."
+    
+    return attachment_context
 
 @app.post("/swarm/debate")
 async def swarm_debate(request: DebateDashboardRequest):
@@ -575,9 +727,27 @@ async def swarm_debate(request: DebateDashboardRequest):
         # ═══ AGENT SYSTEM PROMPTS ═══
         def build_system(agent_id: str, soul: str = "") -> str:
             info = AGENTS[agent_id]
-            base = f"""{SHIFT_LAB_CONTEXT}\n{tenant_ctx}\n{rag_text}\n\nTU ROL: {info['skill']}\n\nINSTRUCCIONES:\n- Eres {info['name']}, consultor senior de {tid.upper()}.\n- Argumenta con datos, frameworks y ejemplos concretos.\n- Sé directo, estratégico y accionable."""
+            base = f"""{SHIFT_LAB_CONTEXT}
+
+# CONTEXTO CORPORATIVO ({tid.upper()})
+{tenant_ctx}
+
+# MEMORIA INSTITUCIONAL (PUNTO MEDIO)
+{rag_text}
+
+# TU ROL ESPECIALIZADO
+Nombre: {info['name']}
+{info['skill']}
+
+# INSTRUCCIONES DE DEBATE (SOP)
+1. **Idioma:** Responde en el mismo idioma del TEMA del debate.
+2. **Formato:** Usa Markdown con `##` para secciones, `**negritas**` para conceptos clave.
+3. **Rigor Argumentativo:** Argumenta con datos, frameworks y ejemplos concretos. Cita estándares de industria.
+4. **Accionabilidad:** Sé directo, estratégico y accionable. Cada punto debe tener implicación táctica.
+5. **Invisible Swarm:** Eres {info['name']}, consultor senior de {tid.upper()}. Nunca menciones el swarm ni el sistema multi-agente.
+6. **Veracidad:** Si no tienes datos, admítelo. No inventes métricas."""
             if soul:
-                base += f"\n\nDIRECTIVA ESPECIAL DEL USUARIO PARA TI:\n{soul}"
+                base += f"\n\n# DIRECTIVA ESPECIAL DEL USUARIO\n{soul}"
             return base
         
         sys_a = build_system(a_id, request.soul_a or "")
@@ -653,11 +823,30 @@ Eres el Juez Estratégico de Shifty Studio Arena. Acabas de presenciar un debate
 @app.post("/swarm/chat")
 async def swarm_chat(request: ChatRequest):
     try:
-        # Transform messages to LangChain format
-        lc_messages = [
-            HumanMessage(content=m.content) if m.role == "user" else AIMessage(content=m.content)
-            for m in request.messages
-        ]
+        # ═══════════════════════════════════════════════════════════════
+        # INTER-AGENT MEMORY: Transform messages to LangChain format
+        # with agent attribution so each agent sees who said what.
+        # Pattern: "[AgentName]: content" for assistant messages with agent_id
+        # ═══════════════════════════════════════════════════════════════
+        def _resolve_agent_name(agent_id: str) -> str:
+            """Resolve agent_id to display name. Returns empty if unknown."""
+            if agent_id in AGENTS:
+                return AGENTS[agent_id]["name"]
+            if agent_id == "shiftai":
+                return "Shifty"
+            return ""
+        
+        lc_messages = []
+        for m in request.messages:
+            if m.role == "user":
+                lc_messages.append(HumanMessage(content=m.content))
+            else:
+                # Annotate assistant messages with agent name for cross-agent awareness
+                agent_name = _resolve_agent_name(m.agent_id) if m.agent_id else ""
+                if agent_name:
+                    lc_messages.append(AIMessage(content=f"[{agent_name}]: {m.content}"))
+                else:
+                    lc_messages.append(AIMessage(content=m.content))
         
         # Determine which agent to use
         target_agent = request.preferred_agent
@@ -667,21 +856,39 @@ async def swarm_chat(request: ChatRequest):
             target_agent = determine_agent_from_message(last_message)
             print(f"[SWARM] Orquestador seleccionó: {target_agent}")
         
-        print(f"[SWARM] Agent: {target_agent}, Model: {request.model}")
-        
-        # Prepare state for agent
-        inputs = {
-            "messages": lc_messages,
-            "context": request.context or "",
-            "active_agent": target_agent,
-            "agent_outputs": {}
-        }
+        print(f"[SWARM] Agent: {target_agent}, Model: {request.model}, Search: {request.search_enabled}")
         
         # Helper seguro para extraer texto
         def get_message_content(messages_list):
             if not messages_list: return ""
             last_msg = messages_list[-1]
             return last_msg.content if hasattr(last_msg, 'content') else str(last_msg)
+
+        # ═══════════════════════════════════════════════════════════════
+        # WEB SEARCH INTEGRATION
+        # Si search_enabled es True, realizamos búsqueda web y añadimos resultados al contexto
+        # ═══════════════════════════════════════════════════════════════
+        web_search_context = ""
+        if request.search_enabled:
+            last_user_message = request.messages[-1].content if request.messages else ""
+            if last_user_message:
+                search_results = await perform_web_search(last_user_message)
+                web_search_context = f"""
+
+[RESULTADOS DE BÚSQUEDA WEB ACTUALIZADA]:
+{search_results}
+
+INSTRUCCIÓN: Utiliza la información de búsqueda web anterior para complementar tu respuesta con datos actualizados y precisos."""
+                print(f"[SWARM] Web search results added: {len(search_results)} chars")
+
+        # ═══════════════════════════════════════════════════════════════
+        # ATTACHMENT PROCESSING
+        # Procesar documentos adjuntos y extraer su contenido para el contexto
+        # ═══════════════════════════════════════════════════════════════
+        attachment_context = ""
+        if request.attachments:
+            attachment_context = process_attachments(request.attachments)
+            print(f"[SWARM] Attachments processed: {len(request.attachments)} files")
 
         # Create agent node with selected model and invoke directly
         safe_tenant_id = str(request.tenant_id or "shift")
@@ -692,12 +899,24 @@ async def swarm_chat(request: ChatRequest):
             agent_llm = get_llm(str(request.model or "Claude 3.5 Sonnet"))
             system_content = f"""
 {SHIFT_LAB_CONTEXT}
+
+# CONTEXTO CORPORATIVO ({safe_tenant_id.upper()})
 {tenant_context}
 
-Eres un asistente de IA profesional y directo de {safe_tenant_id.upper()}. Responde de manera natural y útil.
-IMPORTANTE: NO menciones que eres un "orquestador" o parte de un sistema multi-agente.
-El usuario debe sentir que está hablando directamente contigo.
-            """
+# TU ROL ESPECIALIZADO
+Nombre: Shifty
+Eres el consultor generalista senior de {safe_tenant_id.upper()}. Cubres estrategia, producto, tecnología y operaciones con visión holística.
+
+# INSTRUCCIONES OPERATIVAS (SOP)
+1. **Detección de Idioma:** Responde SIEMPRE en el mismo idioma del usuario (ES/EN/PT). Tono profesional pero cercano.
+2. **Formato Markdown:** Usa `##` para secciones, `**negritas**` para conceptos clave, bloques de código para comandos/datos estructurados.
+3. **Longitud Adaptativa:** Preguntas simples → respuesta directa y breve. Solicitudes estratégicas/técnicas → respuesta estructurada y exhaustiva.
+4. **Invisible Swarm:** Está PROHIBIDO decir "como modelo de lenguaje", "como agente del swarm", "orquestador" o cualquier referencia al sistema multi-agente. Eres Shifty de {safe_tenant_id.upper()}, punto.
+5. **Protocolo de Incertidumbre:** Si no tienes visibilidad sobre un dato, di: "No tengo visibilidad sobre [X] en este momento. ¿Quieres que proceda con una estimación basada en mejores prácticas del sector?"
+6. **Accionabilidad Obligatoria:** Toda respuesta no-trivial debe cerrar con un Next Step concreto o pregunta de seguimiento.
+{web_search_context}
+{attachment_context}
+"""
             messages = [SystemMessage(content=system_content)] + lc_messages
             response = agent_llm.invoke(messages)
             final_msg = response.content if hasattr(response, 'content') else str(response)
@@ -709,7 +928,9 @@ El usuario debe sentir que está hablando directamente contigo.
                 safe_tenant_id
             )
             # Pasando a dict compatible con SwarmState
-            valid_state: SwarmState = {"messages": lc_messages, "context": request.context or "", "active_agent": target_agent, "agent_outputs": {}}
+            # Añadimos web_search_context y attachment_context al context del state
+            context_with_search = (request.context or "") + web_search_context + attachment_context
+            valid_state: SwarmState = {"messages": lc_messages, "context": context_with_search, "active_agent": target_agent, "agent_outputs": {}}
             result_state = agent_node(valid_state)
             final_msg = get_message_content(result_state.get("messages", []))
         
