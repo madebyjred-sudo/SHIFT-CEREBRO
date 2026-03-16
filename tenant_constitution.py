@@ -1,4 +1,4 @@
-"""
+ex"""
 ═══════════════════════════════════════════════════════════════
 TENANT CONSTITUTION v2.0 — Contexto Corporativo Dinámico
 Shift AI Gateway — De hardcodeo a escala Enterprise
