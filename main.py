@@ -2644,7 +2644,7 @@ async def health():
     return {
         "status": "healthy", 
         "service": "shift-cerebro-swarm-v3-legio-digitalis",
-        "version": "v2.0-punto-medio",
+        "version": "v2.1.0-souls",
         "agents_count": len(AGENTS),
         "agents": [info["name"] for info in AGENTS.values()],
         "features": ["dynamic_rag", "pii_scrubber", "taxonomy_validation", "debate_ingestion", "punto_medio"]
