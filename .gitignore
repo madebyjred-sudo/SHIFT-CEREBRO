@@ -1,4 +1,29 @@
 .env
 __pycache__/
-*.pyc
+**/__pycache__/
+*.py[cod]
+*$py.class
+*.so
 .DS_Store
+
+# Railway/Nixpacks cache
+.nixpacks/
+.cache/
+
+# Generated documents (regenerables)
+generated_documents/*
+!generated_documents/.gitkeep
+
+# Python environment
+venv/
+env/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs
+*.log
