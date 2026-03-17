@@ -9,6 +9,7 @@ uvicorn[standard]>=0.24.0
 langchain>=0.1.0
 langchain-openai>=0.0.5
 langgraph>=0.0.20
+openai>=1.0.0  # For DALL-E image generation
 
 # Database
 pymysql>=1.1.0
@@ -25,3 +26,74 @@ httpx>=0.25.0  # For async HTTP requests
 
 # cPanel Deployment (Passenger WSGI bridge)
 a2wsgi>=1.7.0  # Bridges ASGI (FastAPI) to WSGI (Passenger)
+
+# ═══════════════════════════════════════════════════════════════
+# DOCUMENT & CONTENT GENERATION TOOLS
+# ═══════════════════════════════════════════════════════════════
+
+# Microsoft Word documents
+# GitHub: https://github.com/python-openxml/python-docx
+python-docx>=1.1.0
+
+# PDF generation
+# Homepage: https://hg.reportlab.com/hg-public/reportlab/
+reportlab>=4.0.0
+
+# PowerPoint presentations
+# GitHub: https://github.com/scanny/python-pptx
+python-pptx>=0.6.21
+
+# Unstructured document processing (optional - for advanced document parsing)
+# GitHub: https://github.com/Unstructured-IO/unstructured
+# unstructured>=0.12.0  # Uncomment if needed
+
+# ═══════════════════════════════════════════════════════════════
+# DATA ANALYSIS & VISUALIZATION TOOLS
+# ═══════════════════════════════════════════════════════════════
+
+# Data analysis and manipulation
+# GitHub: https://github.com/pandas-dev/pandas
+pandas>=2.0.0
+
+# Data visualization and charts
+# GitHub: https://github.com/matplotlib/matplotlib
+matplotlib>=3.8.0
+
+# Numerical computing (required by matplotlib/pandas)
+numpy>=1.24.0
+
+# ═══════════════════════════════════════════════════════════════
+# NLP & SENTIMENT ANALYSIS TOOLS
+# ═══════════════════════════════════════════════════════════════
+
+# Text processing and sentiment analysis
+# GitHub: https://github.com/sloria/TextBlob
+textblob>=0.17.1
+
+# Download TextBlob corpora (run after installation):
+# python -m textblob.download_corpora lite
+
+# ═══════════════════════════════════════════════════════════════
+# UTILITY TOOLS
+# ═══════════════════════════════════════════════════════════════
+
+# QR Code generation
+# GitHub: https://github.com/lincolnloop/python-qrcode
+qrcode[pil]>=7.4.0
+
+# Word cloud generation
+# GitHub: https://github.com/amueller/word_cloud
+wordcloud>=1.9.0
+
+# Image processing (required by qrcode and wordcloud)
+Pillow>=10.0.0
+
+# ═══════════════════════════════════════════════════════════════
+# OPTIONAL: Document processing extras
+# ═══════════════════════════════════════════════════════════════
+
+# For PDF text extraction (if needed in the future)
+# pypdf>=4.0.0
+
+# For reading Excel files
+# openpyxl>=3.1.0

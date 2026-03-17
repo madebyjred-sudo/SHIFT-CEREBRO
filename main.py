@@ -7,7 +7,7 @@ from datetime import datetime
 from typing import List, Optional, Annotated, TypedDict, Dict, Any
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, FileResponse
 from pydantic import BaseModel, field_validator
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
@@ -140,6 +140,13 @@ llm = get_llm("Claude Sonnet 4.6")
 # TOOLS
 # ═══════════════════════════════════════════════════════════════
 
+# Import all tools (document generation, analysis, visualization)
+from tools import ALL_TOOLS, DOCUMENT_TOOLS, EXTENDED_TOOLS
+
+# Storage configuration for generated documents
+DOCUMENTS_DIR = os.path.join(os.path.dirname(__file__), "generated_documents")
+os.makedirs(DOCUMENTS_DIR, exist_ok=True)
+
 @tool
 def write_file_tool(path: str, content: str):
     """Escribe contenido directamente en un archivo del repositorio."""
@@ -160,7 +167,8 @@ def search_code_tool(query: str, file_pattern: str = "*"):
     """Busca código en el repositorio usando regex."""
     return f"SOLICITUD_BUSQUEDA: {query} en archivos {file_pattern}"
 
-tools = [write_file_tool, read_file_tool, execute_command_tool, search_code_tool]
+# Combine all tools: old + document tools + extended tools
+tools = [write_file_tool, read_file_tool, execute_command_tool, search_code_tool] + ALL_TOOLS
 
 # ═══════════════════════════════════════════════════════════════
 # SKILLS INJECTION - 15 AGENTES LATINOS
@@ -269,6 +277,7 @@ Antes de formular tu respuesta visible, DEBES procesar la información siguiendo
 # 4. FRAMEWORKS CLAVE Y FORMATOS OBLIGATORIOS
 - **Tree of Thought:** Explorar múltiples futuros. Mínimo 3 paths por decisión estratégica.
 - **Quality Loop:** Self-verify → peer-verify → critic pre-screen → present.
+- **Document Generation:** Puedes generar documentos Word profesionales usando las herramientas: `create_word_document` (para documentos generales), `create_brief_document` (para briefs estratégicos), y `create_meeting_minutes` (para actas de reuniones). Los documentos se guardan automáticamente y se proporciona un enlace de descarga.
 - **Decision Format (REQUISITO ESTRICTO DE SALIDA):** Siempre debes responder estructurando tu decisión así:
   - **Bottom Line:** (Tu conclusión final en 1 línea)
   - **What:** (Qué vamos a hacer, con nivel de confianza en %)
@@ -2647,8 +2656,49 @@ async def health():
         "version": "v2.1.0-souls",
         "agents_count": len(AGENTS),
         "agents": [info["name"] for info in AGENTS.values()],
-        "features": ["dynamic_rag", "pii_scrubber", "taxonomy_validation", "debate_ingestion", "punto_medio"]
+        "features": ["dynamic_rag", "pii_scrubber", "taxonomy_validation", "debate_ingestion", "punto_medio", "document_generation"]
     }
+
+
+# ═══════════════════════════════════════════════════════════════
+# DOCUMENT SERVING ENDPOINT — v1.0
+# Serves generated documents for download
+# ═══════════════════════════════════════════════════════════════
+
+@app.get("/documents/{filename}")
+async def serve_document(filename: str):
+    """
+    Serve a generated document for download.
+    Documents are stored in the generated_documents directory.
+    Supports: DOCX, PDF, PPTX, PNG, TXT
+    """
+    # Security: Prevent directory traversal
+    if ".." in filename or "/" in filename:
+        raise HTTPException(status_code=400, detail="Invalid filename")
+    
+    file_path = os.path.join(DOCUMENTS_DIR, filename)
+    
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="Document not found")
+    
+    # Determine content type based on extension
+    content_type_map = {
+        ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        ".pdf": "application/pdf",
+        ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        ".png": "image/png",
+        ".txt": "text/plain",
+    }
+    
+    ext = os.path.splitext(filename)[1].lower()
+    content_type = content_type_map.get(ext, "application/octet-stream")
+    
+    return FileResponse(
+        path=file_path,
+        media_type=content_type,
+        filename=filename
+    )
+
 
 if __name__ == "__main__":
     import uvicorn
