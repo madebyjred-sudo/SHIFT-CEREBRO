@@ -1,4 +1,4 @@
-I a"""
+"""
 ═══════════════════════════════════════════════════════════════
 TENANT CONSTITUTION API v2.0 — Endpoints FastAPI
 Shift AI Gateway — CRUD para Constitución Corporativa
