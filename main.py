@@ -2416,6 +2416,120 @@ async def peaje_ingest_debate(request: PeajeDebateIngestRequest):
 
 
 # ═══════════════════════════════════════════════════════════════
+# PEAJE 2.0 NODES INGESTION (Dual Ingestion)
+# ═══════════════════════════════════════════════════════════════
+
+class NodeMetrics(BaseModel):
+    tokens: Optional[int] = 0
+    time_ms: Optional[int] = 0
+    user_rating: Optional[int] = 0
+
+class ExecutedNode(BaseModel):
+    node_id: str
+    agent: str
+    prompt: Optional[str] = ""
+    output_text: str
+    metrics: Optional[NodeMetrics] = None
+
+class NodeExecutionPayload(BaseModel):
+    session_id: str
+    client_id: str
+    tenant_id: str = "shift"
+    telemetry: Dict[str, Any]
+    executed_nodes: List[ExecutedNode]
+
+@app.post("/peaje/nodes")
+async def peaje_nodes(request: NodeExecutionPayload):
+    """Ingesta asíncrona dedicada para la ejecución de Nodos (Dual Ingestion v2.0).
+    Aísla a Minimax de la topología JSON y solo procesa los textos finales."""
+    try:
+        print(f"[EL PEAJE v2 NODES] Processing session: {request.session_id} | Nodes: {len(request.executed_nodes)}")
+        
+        insights_saved = 0
+        errors = []
+        
+        # Process each node's text output as a separate insight
+        for node in request.executed_nodes:
+            try:
+                if not node.output_text or len(node.output_text) < 20:
+                    continue
+                
+                # Build a synthetic message list for the extractor
+                prompt_text = node.prompt if node.prompt else "Ejecuta tu rol de especialista."
+                synthetic_messages = [
+                    ChatMessage(role="user", content=prompt_text),
+                ]
+                
+                # Extract insight from this node's output
+                insight_data = await extract_insight_data_async(synthetic_messages, node.output_text, request.tenant_id)
+                
+                # PII Scrub
+                scrub_result = full_scrub_pipeline(
+                    insight_text=insight_data["insight_text"],
+                    raw_category=insight_data["category"],
+                    conversation_text=node.output_text,
+                )
+                
+                # Save to database
+                conn = get_db_connection()
+                if conn:
+                    try:
+                        conversation_hash = hashlib.sha256(f"{request.session_id}:{node.node_id}:{node.output_text[:100]}".encode()).hexdigest()
+                        anonymized_hash = hashlib.sha256(f"{request.tenant_id}:{request.session_id}:node:{node.node_id}".encode()).hexdigest()
+                        
+                        with conn.cursor() as cursor:
+                            cursor.execute("""
+                                INSERT INTO peaje_insights 
+                                (tenant_id, session_id, agent_id, insight_text, 
+                                 category, sub_category, industry_vertical,
+                                 sentiment, confidence_score, extraction_model, pii_scrubbed,
+                                 source_type, anonymized_hash, raw_conversation_hash)
+                                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                            """, (
+                                request.tenant_id,
+                                request.session_id,
+                                node.agent,
+                                scrub_result["scrubbed_text"],
+                                scrub_result["validated_category"],
+                                scrub_result["sub_category"],
+                                scrub_result["industry_vertical"],
+                                insight_data["sentiment"],
+                                insight_data["confidence_score"],
+                                "minimax/minimax-m2.5",
+                                scrub_result["pii_scrubbed"],
+                                "nodes_canvas",
+                                anonymized_hash,
+                                conversation_hash,
+                            ))
+                        conn.commit()
+                        insights_saved += 1
+                    except Exception as node_db_err:
+                        errors.append(f"Node {node.node_id}: {str(node_db_err)}")
+                    finally:
+                        conn.close()
+            except Exception as node_err:
+                errors.append(f"Node {node.node_id}: {str(node_err)}")
+        
+        print(f"[EL PEAJE v2 NODES] ✓ {insights_saved} insights saved from canvas | Errors: {len(errors)}")
+        
+        return {
+            "status": "ingested",
+            "version": "v2.0",
+            "source": "nodes_canvas",
+            "tenant": request.tenant_id,
+            "insights_saved": insights_saved,
+            "nodes_processed": len(request.executed_nodes),
+            "telemetry": request.telemetry,
+            "errors": errors[:5] if errors else [],
+            "timestamp": datetime.now().isoformat()
+        }
+        
+    except Exception as e:
+        print(f"[EL PEAJE v2 NODES ERROR] {e}")
+        return {"status": "error", "message": str(e)}
+
+
+# ═══════════════════════════════════════════════════════════════
 # PUNTO MEDIO ENDPOINTS — v2.0
 # ═══════════════════════════════════════════════════════════════
 
