@@ -112,13 +112,14 @@ COMMENT='Telemetría granular por nodo ejecutado — Peaje 2.0';
 -- de sesiones de chat clásico
 -- ═══════════════════════════════════════════════════════════════
 ALTER TABLE peaje_sessions
-    ADD COLUMN IF NOT EXISTS nodes_mode       BOOLEAN DEFAULT FALSE
-        COMMENT 'TRUE si fue una sesión con Nodes Canvas' AFTER debate_mode,
-    ADD COLUMN IF NOT EXISTS nodes_executions INT     DEFAULT 0
+    ADD COLUMN nodes_mode       BOOLEAN DEFAULT FALSE
+        COMMENT 'TRUE si fue una sesión con Nodes Canvas' AFTER debate_mode;
+
+ALTER TABLE peaje_sessions
+    ADD COLUMN nodes_executions INT DEFAULT 0
         COMMENT 'Cuántos canvas runs se hicieron en la sesión' AFTER nodes_mode;
 
--- Crear índice solo si no existe
-CREATE INDEX IF NOT EXISTS idx_nodes_mode ON peaje_sessions (nodes_mode);
+CREATE INDEX idx_nodes_mode ON peaje_sessions (nodes_mode);
 
 
 -- ═══════════════════════════════════════════════════════════════
