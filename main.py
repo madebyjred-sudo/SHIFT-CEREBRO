@@ -1218,6 +1218,51 @@ Antes de responder, procesa la información así:
 | Problema de Funnel     | Santiago (RevOps)  | Identificar fugas técnicas o de proceso.        |
 | Duda de Producto       | Diego (CPO)        | Entender la visión y el valor para el cliente.  |
 | Emergencia Legal/Fin   | Patricia/Roberto   | Mitigar riesgos críticos inmediatamente.         |
+
+# 8. MODO NODOS / GRAPH BUILDER (CAPACIDAD ESPECIAL)
+Cuando el usuario activa el "Modo Nodos" en Shifty Studio, tu rol cambia a **Orquestador de Workflows Visuales**.
+El frontend detecta un bloque JSON con la clave `topology` en tu respuesta y lo renderiza como un grafo visual de nodos interconectados.
+
+## INSTRUCCIÓN CRÍTICA:
+Cuando detectes la instrucción `[SYSTEM INSTRUCTION:` en el mensaje del usuario (indica modo Nodos activo), DEBES responder **EXCLUSIVAMENTE** con un bloque de código JSON markdown. NO incluyas texto conversacional antes ni después del bloque JSON.
+
+## FORMATO OBLIGATORIO DE RESPUESTA:
+```json
+{
+  "topology": {
+    "nodes": [
+      { "id": "n1", "type": "context", "data": { "text": "Descripción del contexto o brief inicial" } },
+      { "id": "n2", "type": "specialist", "data": { "agent": "valentina", "prompt": "Instrucción específica para este agente" } },
+      { "id": "n3", "type": "specialist", "data": { "agent": "roberto", "prompt": "Instrucción específica para este agente" } },
+      { "id": "n4", "type": "export", "data": { "format": "DOCX" } }
+    ],
+    "edges": [
+      { "source": "n1", "target": "n2" },
+      { "source": "n2", "target": "n3" },
+      { "source": "n3", "target": "n4" }
+    ]
+  }
+}
+```
+
+## TIPOS DE NODOS DISPONIBLES:
+1. **context** — Nodo de entrada (azul). Contiene el brief o contexto inicial. `data: { "text": "..." }`. Solo tiene output (source).
+2. **specialist** — Nodo de procesamiento (indigo). Asigna un agente de Legio Digitalis. `data: { "agent": "<id>", "prompt": "..." }`. Tiene input (target) y output (source).
+3. **export** — Nodo de salida (esmeralda). Define formato de exportación. `data: { "format": "DOCX|PPTX|PDF|XLSX" }`. Solo tiene input (target).
+
+## AGENTES VÁLIDOS PARA NODOS SPECIALIST:
+- `carmen` (CEO), `roberto` (CFO), `valentina` (CMO), `diego` (CPO)
+- `jorge` (Content), `lucia` (SEO), `isabella` (Paid Media), `mateo` (Social)
+- `andres` (Analytics), `daniela` (Competitive Intel), `emilio` (Customer Success)
+- `patricia` (Legal), `santiago` (RevOps), `catalina` (Project Mgr), `shiftai` (General)
+
+## REGLAS DE TOPOLOGÍA:
+- El grafo DEBE ser un DAG (Directed Acyclic Graph) — sin ciclos.
+- SIEMPRE empieza con al menos un nodo `context` y termina con un nodo `export`.
+- Los `edges` definen el flujo de datos entre nodos (source → target).
+- Usa IDs incrementales simples: n1, n2, n3...
+- Asigna el agente más relevante según la tarea de cada nodo.
+- Escribe prompts específicos y accionables para cada specialist.
 """
 
 # ═══════════════════════════════════════════════════════════════
@@ -1923,10 +1968,19 @@ async def swarm_chat(request: ChatRequest, background_tasks: BackgroundTasks):
                 else:
                     lc_messages.append(AIMessage(content=m.content))
         
+        # ═══════════════════════════════════════════════════════════════
+        # NODES MODE DETECTION: Force routing to Shifty orchestrator
+        # when the frontend sends the [SYSTEM INSTRUCTION: marker
+        # ═══════════════════════════════════════════════════════════════
+        last_message_content = request.messages[-1].content if request.messages else ""
+        is_nodes_mode = "[SYSTEM INSTRUCTION:" in last_message_content
+        
         target_agent = request.preferred_agent
-        if not target_agent or target_agent not in AGENTS:
-            last_message = request.messages[-1].content if request.messages else ""
-            target_agent = determine_agent_from_message(last_message)
+        if is_nodes_mode:
+            target_agent = "shiftai"
+            print(f"[SWARM] 🔮 Nodes Mode detected — forcing orchestrator: shiftai")
+        elif not target_agent or target_agent not in AGENTS:
+            target_agent = determine_agent_from_message(last_message_content)
             print(f"[SWARM] Orquestador seleccionó: {target_agent}")
         
         print(f"[SWARM] Agent: {target_agent}, Model: {request.model}, Search: {request.search_enabled}")
