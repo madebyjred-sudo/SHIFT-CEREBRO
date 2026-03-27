@@ -2495,46 +2495,124 @@ class NodeExecutionPayload(BaseModel):
 @app.post("/peaje/nodes")
 async def peaje_nodes(request: NodeExecutionPayload):
     """Ingesta asíncrona dedicada para la ejecución de Nodos (Dual Ingestion v2.0).
-    Aísla a Minimax de la topología JSON y solo procesa los textos finales."""
+    
+    Estrategia Omnisciente:
+    1. Persiste telemetría macro en peaje_node_executions
+    2. Persiste métricas por nodo en peaje_node_outputs
+    3. Extrae insights semánticos por nodo → peaje_insights (source_type='nodes_canvas')
+    4. Actualiza peaje_sessions con nodes_mode=TRUE
+    5. Aísla a Minimax del JSON topology — solo procesa output_text
+    """
     try:
         print(f"[EL PEAJE v2 NODES] Processing session: {request.session_id} | Nodes: {len(request.executed_nodes)}")
-        
+
         insights_saved = 0
+        node_output_records = []
         errors = []
-        
-        # Process each node's text output as a separate insight
-        for node in request.executed_nodes:
+
+        # ── PASO 1: Insertar registro maestro de ejecución ──────────────
+        conn_exec = get_db_connection()
+        execution_db_id = None
+        if conn_exec:
+            try:
+                telemetry = request.telemetry or {}
+                with conn_exec.cursor() as cur:
+                    cur.execute("""
+                        INSERT INTO peaje_node_executions
+                        (execution_id, session_id, tenant_id, client_id,
+                         total_time_ms, user_interventions, node_count,
+                         nodes_succeeded, nodes_failed, status, insights_saved)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        ON DUPLICATE KEY UPDATE
+                            updated_at = NOW()
+                    """, (
+                        request.session_id,                          # execution_id = session del canvas run
+                        request.session_id,
+                        request.tenant_id,
+                        request.client_id,
+                        telemetry.get("total_time_ms", 0),
+                        telemetry.get("user_interventions", 0),
+                        len(request.executed_nodes),
+                        0,   # se actualiza al final
+                        0,
+                        "processing",
+                        0,
+                    ))
+                    execution_db_id = conn_exec.insert_id()
+                conn_exec.commit()
+            except Exception as exec_err:
+                print(f"[PEAJE NODES] Error inserting execution record: {exec_err}")
+                errors.append(f"execution_record: {str(exec_err)}")
+            finally:
+                conn_exec.close()
+
+        # ── PASO 2: Marcar sesión como nodes_mode=TRUE ───────────────────
+        conn_sess = get_db_connection()
+        if conn_sess:
+            try:
+                with conn_sess.cursor() as cur:
+                    # Upsert de sesión con nodes_mode
+                    cur.execute("""
+                        INSERT INTO peaje_sessions
+                        (tenant_id, session_id, nodes_mode, nodes_executions, source)
+                        VALUES (%s, %s, TRUE, 1, 'nodes_canvas')
+                        ON DUPLICATE KEY UPDATE
+                            nodes_mode = TRUE,
+                            nodes_executions = COALESCE(nodes_executions, 0) + 1,
+                            message_count = message_count + %s
+                    """, (
+                        request.tenant_id,
+                        request.session_id,
+                        len(request.executed_nodes),
+                    ))
+                conn_sess.commit()
+            except Exception as sess_err:
+                # Si nodes_mode no existe aún (antes de migración), log y continúa
+                print(f"[PEAJE NODES] Session upsert error (migration needed?): {sess_err}")
+            finally:
+                conn_sess.close()
+
+        # ── PASO 3: Procesar cada nodo (insight + telemetría por nodo) ───
+        for node_order, node in enumerate(request.executed_nodes):
             try:
                 if not node.output_text or len(node.output_text) < 20:
+                    node_output_records.append((node, node_order, None))
                     continue
-                
+
                 # Build a synthetic message list for the extractor
                 prompt_text = node.prompt if node.prompt else "Ejecuta tu rol de especialista."
                 synthetic_messages = [
                     ChatMessage(role="user", content=prompt_text),
                 ]
-                
+
                 # Extract insight from this node's output
                 insight_data = await extract_insight_data_async(synthetic_messages, node.output_text, request.tenant_id)
-                
+
                 # PII Scrub
                 scrub_result = full_scrub_pipeline(
                     insight_text=insight_data["insight_text"],
                     raw_category=insight_data["category"],
                     conversation_text=node.output_text,
                 )
-                
-                # Save to database
-                conn = get_db_connection()
-                if conn:
+
+                conn_node = get_db_connection()
+                insight_id = None
+                if conn_node:
                     try:
-                        conversation_hash = hashlib.sha256(f"{request.session_id}:{node.node_id}:{node.output_text[:100]}".encode()).hexdigest()
-                        anonymized_hash = hashlib.sha256(f"{request.tenant_id}:{request.session_id}:node:{node.node_id}".encode()).hexdigest()
-                        
-                        with conn.cursor() as cursor:
+                        conversation_hash = hashlib.sha256(
+                            f"{request.session_id}:{node.node_id}:{node.output_text[:100]}".encode()
+                        ).hexdigest()
+                        anonymized_hash = hashlib.sha256(
+                            f"{request.tenant_id}:{request.session_id}:node:{node.node_id}".encode()
+                        ).hexdigest()
+                        prompt_hash = hashlib.sha256(prompt_text.encode()).hexdigest() if prompt_text else None
+                        metrics = node.metrics or NodeMetrics()
+
+                        with conn_node.cursor() as cursor:
+                            # 3a. Insertar insight semántico
                             cursor.execute("""
-                                INSERT INTO peaje_insights 
-                                (tenant_id, session_id, agent_id, insight_text, 
+                                INSERT INTO peaje_insights
+                                (tenant_id, session_id, agent_id, insight_text,
                                  category, sub_category, industry_vertical,
                                  sentiment, confidence_score, extraction_model, pii_scrubbed,
                                  source_type, anonymized_hash, raw_conversation_hash)
@@ -2555,17 +2633,74 @@ async def peaje_nodes(request: NodeExecutionPayload):
                                 anonymized_hash,
                                 conversation_hash,
                             ))
-                        conn.commit()
+                            insight_id = conn_node.insert_id()
+
+                            # 3b. Insertar telemetría del nodo en peaje_node_outputs
+                            cursor.execute("""
+                                INSERT INTO peaje_node_outputs
+                                (execution_id, tenant_id, session_id,
+                                 node_id, agent_id, node_order,
+                                 prompt_hash, prompt_preview,
+                                 output_chars, output_quality,
+                                 tokens_used, time_ms, user_rating, insight_id)
+                                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                            """, (
+                                request.session_id,          # execution_id
+                                request.tenant_id,
+                                request.session_id,
+                                node.node_id,
+                                node.agent,
+                                node_order,
+                                prompt_hash,
+                                prompt_text[:500] if prompt_text else None,   # preview sanitizado
+                                len(node.output_text),
+                                insight_data.get("confidence_score", None),   # output_quality = confidence
+                                metrics.tokens or 0,
+                                metrics.time_ms or 0,
+                                metrics.user_rating or 0,
+                                insight_id,
+                            ))
+
+                        conn_node.commit()
                         insights_saved += 1
+                        node_output_records.append((node, node_order, insight_id))
+
                     except Exception as node_db_err:
-                        errors.append(f"Node {node.node_id}: {str(node_db_err)}")
+                        errors.append(f"Node {node.node_id} DB: {str(node_db_err)}")
+                        conn_node.rollback()
                     finally:
-                        conn.close()
+                        conn_node.close()
+
             except Exception as node_err:
                 errors.append(f"Node {node.node_id}: {str(node_err)}")
-        
-        print(f"[EL PEAJE v2 NODES] ✓ {insights_saved} insights saved from canvas | Errors: {len(errors)}")
-        
+
+        # ── PASO 4: Actualizar registro de ejecución con resultados ──────
+        conn_update = get_db_connection()
+        if conn_update:
+            try:
+                with conn_update.cursor() as cur:
+                    cur.execute("""
+                        UPDATE peaje_node_executions
+                        SET insights_saved  = %s,
+                            nodes_succeeded = %s,
+                            nodes_failed    = %s,
+                            status          = %s
+                        WHERE execution_id = %s
+                    """, (
+                        insights_saved,
+                        insights_saved,
+                        len(request.executed_nodes) - insights_saved,
+                        "completed" if not errors else "partial",
+                        request.session_id,
+                    ))
+                conn_update.commit()
+            except Exception as upd_err:
+                print(f"[PEAJE NODES] Error updating execution record: {upd_err}")
+            finally:
+                conn_update.close()
+
+        print(f"[EL PEAJE v2 NODES] ✓ {insights_saved}/{len(request.executed_nodes)} nodes saved | Errors: {len(errors)}")
+
         return {
             "status": "ingested",
             "version": "v2.0",
@@ -2577,7 +2712,7 @@ async def peaje_nodes(request: NodeExecutionPayload):
             "errors": errors[:5] if errors else [],
             "timestamp": datetime.now().isoformat()
         }
-        
+
     except Exception as e:
         print(f"[EL PEAJE v2 NODES ERROR] {e}")
         return {"status": "error", "message": str(e)}
