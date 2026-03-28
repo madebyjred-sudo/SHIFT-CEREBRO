@@ -1969,16 +1969,22 @@ async def swarm_chat(request: ChatRequest, background_tasks: BackgroundTasks):
                     lc_messages.append(AIMessage(content=m.content))
         
         # ═══════════════════════════════════════════════════════════════
-        # NODES MODE DETECTION: Force routing to Shifty orchestrator
-        # when the frontend sends the [SYSTEM INSTRUCTION: marker
+        # NODES MODE DETECTION: Route to Shifty orchestrator ONLY when
+        # no specific agent is requested. This allows the lab and other
+        # direct API consumers to specify agents while maintaining
+        # backward compatibility for the frontend graph builder.
         # ═══════════════════════════════════════════════════════════════
         last_message_content = request.messages[-1].content if request.messages else ""
         is_nodes_mode = "[SYSTEM INSTRUCTION:" in last_message_content
         
         target_agent = request.preferred_agent
-        if is_nodes_mode:
+        # Only force shiftai if we're in nodes mode AND no specific agent was requested
+        # This allows direct API calls (like the lab) to specify preferred_agent
+        if is_nodes_mode and (not target_agent or target_agent == "shiftai"):
             target_agent = "shiftai"
             print(f"[SWARM] 🔮 Nodes Mode detected — forcing orchestrator: shiftai")
+        elif is_nodes_mode and target_agent:
+            print(f"[SWARM] 🔮 Nodes Mode with explicit agent: {target_agent} — respecting preference")
         elif not target_agent or target_agent not in AGENTS:
             target_agent = determine_agent_from_message(last_message_content)
             print(f"[SWARM] Orquestador seleccionó: {target_agent}")
@@ -3004,6 +3010,97 @@ async def health():
         "features": ["dynamic_rag", "pii_scrubber", "taxonomy_validation", "debate_ingestion", "punto_medio", "document_generation"]
     }
 
+
+# ═══════════════════════════════════════════════════════════════
+# EXPORT ENDPOINT — v1.0
+# Generates documents directly from node execution
+# ═══════════════════════════════════════════════════════════════
+
+class DocumentExportRequest(BaseModel):
+    format: str = "DOCX"
+    title: str
+    content: str
+    subtitle: Optional[str] = None
+    author: str = "Shift AI"
+    sections: Optional[List[Dict[str, str]]] = None
+
+@app.post("/export/document")
+async def export_document(req: DocumentExportRequest):
+    fmt = req.format.upper()
+    try:
+        print(f"[EXPORT] Generating document ({fmt}): {req.title}")
+        
+        if fmt == "DOCX":
+            from tools.document_tools import create_word_document
+            result = create_word_document.func(
+                title=req.title,
+                content=req.content,
+                subtitle=req.subtitle,
+                author=req.author,
+                sections=req.sections
+            )
+            return {"url": result}
+            
+        elif fmt == "PDF":
+            from tools.extended_tools import generate_pdf_report
+            result = generate_pdf_report.func(
+                title=req.title,
+                content=req.content,
+                report_type="nodes_export",
+                sections=req.sections,
+                include_toc=True
+            )
+            return {"url": result}
+            
+        elif fmt == "PPTX":
+            from tools.extended_tools import create_presentation
+            slides_content = []
+            if req.content and len(req.content) > 0:
+                slides_content.append({"title": "Resumen Ejecutivo", "content": req.content})
+            if req.sections:
+                for sec in req.sections:
+                    slides_content.append({
+                        "title": sec.get("heading", ""),
+                        "content": sec.get("content", "")
+                    })
+            result = create_presentation.func(
+                title=req.title,
+                subtitle=req.subtitle,
+                slides_content=slides_content,
+                template="corporate"
+            )
+            return {"url": result}
+            
+        elif fmt == "XLSX":
+            import pandas as pd
+            import os
+            from datetime import datetime
+            from tools.document_tools import DOCUMENTS_DIR
+            
+            data = []
+            if req.sections:
+                for sec in req.sections:
+                    data.append({
+                        "Nodo/Especialista": sec.get("heading", ""),
+                        "Análisis/Output": sec.get("content", "")
+                    })
+            else:
+                data.append({"Resumen": req.content})
+                
+            df = pd.DataFrame(data)
+            
+            filename = f"export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+            file_path = os.path.join(DOCUMENTS_DIR, filename)
+            
+            df.to_excel(file_path, index=False)
+            return {"url": f"/documents/{filename}"}
+            
+        else:
+            raise HTTPException(status_code=400, detail=f"Format {fmt} not supported yet")
+
+    except Exception as e:
+        print(f"[EXPORT ERROR] {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 # ═══════════════════════════════════════════════════════════════
 # DOCUMENT SERVING ENDPOINT — v1.0
