@@ -2003,11 +2003,53 @@ async def swarm_chat(request: ChatRequest, background_tasks: BackgroundTasks):
             attachment_context = process_attachments(request.attachments)
 
         safe_tenant_id = str(request.tenant_id or "shift")
-        tenant_context = TENANT_CONTEXTS.get(safe_tenant_id, TENANT_CONTEXTS["shift"])
+
+        # Enrich the fast-path orchestrator with the same strategic context
+        # and role instructions used by the full specialized agents.
+        try:
+            rag_conn = get_db_connection()
+            dynamic_rag = get_dynamic_rag(rag_conn, safe_tenant_id)
+            punto_medio_injection = dynamic_rag["combined_rag"]
+            if rag_conn:
+                rag_conn.close()
+        except Exception as rag_err:
+            print(f"[SWARM] Dynamic RAG fallback for {safe_tenant_id}: {rag_err}")
+            punto_medio_injection = PUNTO_MEDIO_GLOBAL_RAG
+
+        tenant_conn = get_db_connection()
+        try:
+            tenant_context = get_tenant_context_with_fallback(tenant_conn, safe_tenant_id)
+        finally:
+            if tenant_conn:
+                tenant_conn.close()
 
         if target_agent == "shiftai":
             agent_llm = get_llm(str(request.model or "Claude 3.5 Sonnet"))
-            system_content = f"{SHIFT_LAB_CONTEXT}\n\n# CONTEXTO CORPORATIVO ({safe_tenant_id.upper()})\n{tenant_context}\n\n# TU ROL ESPECIALIZADO\nNombre: Shifty\nEres el consultor generalista senior de {safe_tenant_id.upper()}.\n\n# INSTRUCCIONES OPERATIVAS (SOP)\n1. Detección de Idioma: ES/EN/PT.\n2. Formato Markdown.\n3. Longitud Adaptativa.\n4. Invisible Swarm.\n5. Protocolo de Incertidumbre.\n6. Accionabilidad Obligatoria.\n{web_search_context}\n{attachment_context}"
+            shifty_skill = AGENTS["shiftai"]["skill"]
+            nodes_mode_guardrail = """
+# MODO NODOS (ENFORCEMENT ESTRICTO)
+El último mensaje contiene la marca [SYSTEM INSTRUCTION: ...], por lo tanto debes responder EXCLUSIVAMENTE con un bloque ```json ...``` válido para topología de nodos.
+No incluyas texto conversacional antes ni después del JSON.
+""" if is_nodes_mode else ""
+
+            system_content = f"""
+{SHIFT_LAB_CONTEXT}
+
+# CONTEXTO CORPORATIVO ({safe_tenant_id.upper()})
+{tenant_context}
+
+# MEMORIA INSTITUCIONAL (PUNTO MEDIO)
+{punto_medio_injection}
+
+# TU ROL ESPECIALIZADO
+Nombre: {AGENTS['shiftai']['name']}
+{shifty_skill}
+
+{nodes_mode_guardrail}
+{web_search_context}
+{attachment_context}
+"""
+
             messages = [SystemMessage(content=system_content)] + lc_messages
             response = agent_llm.invoke(messages)
             final_msg = response.content if hasattr(response, 'content') else str(response)
