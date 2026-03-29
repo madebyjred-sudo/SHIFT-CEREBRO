@@ -1502,9 +1502,22 @@ def create_agent_node_with_model(agent_id: str, model_name: str, tenant_id: str 
             active_tools = [read_file_tool, search_code_tool]
             print(f"[SECURITY] Read-only mode active for {tid}. Write/Execute tools blocked.")
 
+        # Detectar si estamos en Modo Nodos por parte del UI
+        is_nodes_mode = any("[SYSTEM INSTRUCTION: MODO NODOS]" in m.content for m in state.get("messages", []))
+        
+        nodes_specialist_guardrail = """
+# MODO NODOS ACTIVO (ENFORCEMENT ESTRICTO DE TEXTO)
+Estás participando como un especialista en un flujo de trabajo de nodos visuales. 
+Tu única misión es leer el contexto previo, aplicar tu conocimiento especializado y DEVOLVER TEXTO PLANO ORGÁNICO.
+ESTRICTAMENTE PROHIBIDO:
+- NO devuelvas estructuras JSON.
+- NO imites al Orquestador devolviendo esquemas (nodes/edges).
+- Limita tu respuesta a tu análisis narrativo experto, puedes usar subtítulos (Markdown).
+""" if is_nodes_mode else ""
+
         # Get context from state (includes web search results if enabled)
         context_from_state = state.get("context", "")
-        
+
         # INYECCIÓN DEL RAG (Dynamic Graph Injection)
         system_content = f"""
 {SHIFT_LAB_CONTEXT}
@@ -1530,6 +1543,8 @@ Nombre: {agent_info['name']}
 6. **Protocolo de Incertidumbre:** Si no tienes visibilidad sobre un dato específico de {tid.upper()}, di: "No tengo visibilidad sobre [X] en este momento. ¿Quieres que proceda con una estimación basada en mejores prácticas del sector?"
 7. **Accionabilidad Obligatoria:** Toda respuesta no-trivial debe cerrar con un Next Step concreto o pregunta de seguimiento.
 8. **Continuidad Conversacional:** El historial puede contener respuestas previas de otros consultores del equipo, marcadas como `[Nombre]: texto`. Aprovecha ese contexto para dar continuidad — no repitas lo que ya se dijo, complementa o profundiza.
+
+{nodes_specialist_guardrail}
 """
         
         # Use the selected model
