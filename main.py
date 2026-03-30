@@ -1431,6 +1431,7 @@ class ChatRequest(BaseModel):
     session_id: Optional[str] = None
     search_enabled: Optional[bool] = False
     attachments: Optional[List[Attachment]] = []
+    user_metadata: Optional[dict] = None
 
     @field_validator("messages")
     @classmethod
@@ -1453,8 +1454,8 @@ class DebateDashboardRequest(BaseModel):
     tenant_id: str = "shift"
     session_id: Optional[str] = None
 
-def create_agent_node_with_model(agent_id: str, model_name: str, tenant_id: str = "shift"):
-    """Factory function para crear nodos de agentes con modelo específico e inyección de RAG/Tenant DINÁMICO."""
+def create_agent_node_with_model(agent_id: str, model_name: str, tenant_id: str = "shift", user_metadata: dict = None):
+    """Factory function para crear nodos de agentes con modelo específico e inyección de RAG/Tenant DINÁMICO + Identity User."""
     def agent_node(state: SwarmState):
         agent_info = AGENTS[agent_id]
         # Asegurar que tid sea siempre string
@@ -1518,6 +1519,16 @@ ESTRICTAMENTE PROHIBIDO:
         # Get context from state (includes web search results if enabled)
         context_from_state = state.get("context", "")
 
+        user_profile_context = ""
+        if user_metadata:
+            user_profile_context = f"""
+# PERFIL DEL USUARIO (A QUIÉN LE HABLAS)
+Nombre: {user_metadata.get('shift_name', 'Usuario')}
+Área de Impacto: {user_metadata.get('shift_area', 'No especificada')}
+Estilo de Interacción Solicitado: {user_metadata.get('shift_vibe', 'Estándar')}
+INSTRUCCIÓN OBLIGATORIA: Dirígete al usuario por su nombre. Adapta tu tono, complejidad técnica y formato de respuesta para encajar perfectamente con su 'Estilo de Interacción Solicitado'.
+"""
+
         # INYECCIÓN DEL RAG (Dynamic Graph Injection)
         system_content = f"""
 {SHIFT_LAB_CONTEXT}
@@ -1527,6 +1538,8 @@ ESTRICTAMENTE PROHIBIDO:
 
 # MEMORIA INSTITUCIONAL (PUNTO MEDIO)
 {punto_medio_injection}
+
+{user_profile_context}
 
 {context_from_state}
 
@@ -2088,6 +2101,16 @@ El último mensaje contiene la marca [SYSTEM INSTRUCTION: ...], por lo tanto deb
 No incluyas texto conversacional antes ni después del JSON.
 """ if is_nodes_mode else ""
 
+            user_profile_context = ""
+            if request.user_metadata:
+                user_profile_context = f"""
+# PERFIL DEL USUARIO (A QUIÉN LE HABLAS)
+Nombre: {request.user_metadata.get('shift_name', 'Usuario')}
+Área de Impacto: {request.user_metadata.get('shift_area', 'No especificada')}
+Estilo de Interacción Solicitado: {request.user_metadata.get('shift_vibe', 'Estándar')}
+INSTRUCCIÓN OBLIGATORIA: Dirígete al usuario por su nombre. Adapta tu tono, complejidad técnica y formato de respuesta para encajar perfectamente con su 'Estilo de Interacción Solicitado'.
+"""
+
             system_content = f"""
 {SHIFT_LAB_CONTEXT}
 
@@ -2096,6 +2119,8 @@ No incluyas texto conversacional antes ni después del JSON.
 
 # MEMORIA INSTITUCIONAL (PUNTO MEDIO)
 {punto_medio_injection}
+
+{user_profile_context}
 
 # TU ROL ESPECIALIZADO
 Nombre: {AGENTS['shiftai']['name']}
@@ -2110,7 +2135,7 @@ Nombre: {AGENTS['shiftai']['name']}
             response = agent_llm.invoke(messages)
             final_msg = response.content if hasattr(response, 'content') else str(response)
         else:
-            agent_node = create_agent_node_with_model(target_agent, str(request.model or "Claude 3.5 Sonnet"), safe_tenant_id)
+            agent_node = create_agent_node_with_model(target_agent, str(request.model or "Claude 3.5 Sonnet"), safe_tenant_id, request.user_metadata)
             context_with_search = (request.context or "") + web_search_context + attachment_context
             valid_state: SwarmState = {"messages": lc_messages, "context": context_with_search, "active_agent": target_agent, "agent_outputs": {}}
             result_state = agent_node(valid_state)
