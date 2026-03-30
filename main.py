@@ -1691,26 +1691,44 @@ Responde en el mismo idioma de la pregunta."""
         return f"[Error en búsqueda web: {str(e)}]"
 
 
-def process_attachments(attachments: List[Attachment]) -> str:
+def process_attachments(attachments: List[Attachment]) -> dict:
     """
     Process attached files and extract their content for the AI context.
-    Supports: PDF, DOCX, TXT, CSV, JSON, MD files.
+    Supports: PDF, DOCX, TXT, CSV, JSON, MD files + images (JPEG, PNG, WebP, GIF).
+    
+    Returns:
+        dict with:
+          - "text_context": str  (extracted text from documents, injected into system prompt)
+          - "images": list       (image data for multimodal LLM messages)
     """
+    result = {"text_context": "", "images": []}
+    
     if not attachments:
-        return ""
+        return result
     
     import base64
     from io import BytesIO
     
-    attachment_context = "\n\n[DOCUMENTOS ADJUNTOS]:\n"
+    IMAGE_TYPES = {"image/jpeg", "image/png", "image/webp", "image/gif", "image/jpg"}
+    
+    text_parts = []
     
     for att in attachments:
         try:
-            # Decode base64 content
+            # ── IMAGE ATTACHMENTS → multimodal ──
+            if att.type in IMAGE_TYPES:
+                result["images"].append({
+                    "mime_type": att.type,
+                    "base64": att.content,  # already base64 from frontend
+                    "name": att.name,
+                })
+                print(f"[ATTACHMENT] Image queued for vision: {att.name} ({att.type})")
+                continue
+            
+            # ── DOCUMENT ATTACHMENTS → text extraction ──
             file_content = base64.b64decode(att.content)
             file_text = ""
             
-            # Extract text based on file type
             if att.type == "application/pdf":
                 try:
                     import pypdf
@@ -1734,7 +1752,6 @@ def process_attachments(attachments: List[Attachment]) -> str:
                     file_text = f"[Error extracting DOCX: {str(e)}]"
                     
             elif att.type in ["text/plain", "text/csv", "text/markdown", "application/json"]:
-                # Text files can be decoded directly
                 file_text = file_content.decode('utf-8', errors='replace')
                 
             else:
@@ -1744,17 +1761,21 @@ def process_attachments(attachments: List[Attachment]) -> str:
             if len(file_text) > 4000:
                 file_text = file_text[:4000] + "\n...[Contenido truncado por longitud]"
             
-            # Add to context with markdown formatting
-            attachment_context += f"\n## {att.name}\n```\n{file_text}\n```\n"
+            text_parts.append(f"\n## {att.name}\n```\n{file_text}\n```\n")
             print(f"[ATTACHMENT] Processed {att.name}: {len(file_text)} chars")
             
         except Exception as e:
             print(f"[ATTACHMENT ERROR] Failed to process {att.name}: {e}")
-            attachment_context += f"\n## {att.name}\n[Error al procesar archivo: {str(e)}]\n"
+            text_parts.append(f"\n## {att.name}\n[Error al procesar archivo: {str(e)}]\n")
     
-    attachment_context += "\nINSTRUCCIÓN: Analiza los documentos adjuntos anteriores y úsalos como contexto para tu respuesta."
+    if text_parts:
+        result["text_context"] = "\n\n[DOCUMENTOS ADJUNTOS]:\n" + "".join(text_parts)
+        result["text_context"] += "\nINSTRUCCIÓN: Analiza los documentos adjuntos anteriores y úsalos como contexto para tu respuesta."
     
-    return attachment_context
+    if result["images"]:
+        print(f"[ATTACHMENT] {len(result['images'])} image(s) ready for multimodal vision")
+    
+    return result
 
 @app.post("/swarm/debate")
 async def swarm_debate(request: DebateDashboardRequest):
@@ -2019,9 +2040,23 @@ async def swarm_chat(request: ChatRequest, background_tasks: BackgroundTasks):
                 search_results = await perform_web_search(last_user_message)
                 web_search_context = f"\n\n[RESULTADOS DE BÚSQUEDA WEB ACTUALIZADA]:\n{search_results}\n\nINSTRUCCIÓN: Utiliza la información de búsqueda web anterior para complementar tu respuesta."
 
-        attachment_context = ""
+        attachment_result = {"text_context": "", "images": []}
         if request.attachments:
-            attachment_context = process_attachments(request.attachments)
+            attachment_result = process_attachments(request.attachments)
+        attachment_context = attachment_result["text_context"]
+
+        # ═══ MULTIMODAL VISION: Inject images into last HumanMessage ═══
+        if attachment_result["images"] and lc_messages:
+            last_msg = lc_messages[-1]
+            if hasattr(last_msg, 'content'):
+                multimodal_content = [{"type": "text", "text": last_msg.content if isinstance(last_msg.content, str) else str(last_msg.content)}]
+                for img in attachment_result["images"]:
+                    multimodal_content.append({
+                        "type": "image_url",
+                        "image_url": {"url": f"data:{img['mime_type']};base64,{img['base64']}"}
+                    })
+                lc_messages[-1] = HumanMessage(content=multimodal_content)
+                print(f"[SWARM] ✓ Multimodal message built with {len(attachment_result['images'])} image(s)")
 
         safe_tenant_id = str(request.tenant_id or "shift")
 
