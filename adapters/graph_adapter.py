@@ -6,8 +6,9 @@ Implements the Modo Nodos chat-first backend contract from the Redesign Plan.
 """
 import json
 import time
+import uuid
 import asyncio
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple
 from fastapi import APIRouter, HTTPException, BackgroundTasks
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
@@ -25,6 +26,15 @@ from punto_medio import get_dynamic_rag
 from tenant_constitution import get_tenant_context_with_fallback
 
 graph_router = APIRouter(prefix="/graph", tags=["graph"])
+
+# ═══════════════════════════════════════════════════════════════
+# HITL — In-memory pause registry (single-worker, Railway)
+# ═══════════════════════════════════════════════════════════════
+# Key: pause_id → (asyncio.Event, holder dict with decision)
+# Cleanup: finally block in SSE stream + 30 min timeout
+_pause_events: Dict[str, Tuple[asyncio.Event, dict]] = {}
+
+HITL_TIMEOUT_SECONDS = 1800  # 30 minutes
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -47,6 +57,12 @@ class GraphExecuteRequest(BaseModel):
     model: Optional[str] = "Claude 3.5 Sonnet"
     session_id: Optional[str] = None
     user_metadata: Optional[dict] = None
+
+
+class GraphResumeRequest(BaseModel):
+    """Request body for /graph/resume — resumes a paused HITL node"""
+    pause_id: str
+    decision: str = "approve"  # "approve" | "reject"
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -196,13 +212,45 @@ async def graph_execute(request: GraphExecuteRequest, background_tasks: Backgrou
                     except Exception as agent_err:
                         yield _sse_event("error", node_id, f"Error: {str(agent_err)}", progress, agent_name=agent_name)
                 
-                # ═══ REVISION (HITL) NODE ═══
+                # ═══ REVISION (HITL) NODE — REAL PAUSE ═══
                 elif node_type == "revision":
                     prompt = node_data.get("prompt", "Revisa antes de continuar")
-                    yield _sse_event("hitl_pause", node_id, prompt, progress, agent_name="Revisión Humana")
-                    # Note: The frontend handles the pause and sends a resume signal.
-                    # In v1, we continue automatically (HITL is visual-only in SSE).
-                    # Full HITL with bidirectional control is v2.
+                    pause_id = str(uuid.uuid4())
+                    event = asyncio.Event()
+                    holder: dict = {}
+                    _pause_events[pause_id] = (event, holder)
+                    
+                    yield _sse_event("hitl_pause", node_id, prompt, progress, agent_name="Revisión Humana", pause_id=pause_id)
+                    print(f"[EXECUTE] HITL pause: {pause_id} — waiting for /graph/resume")
+                    
+                    try:
+                        await asyncio.wait_for(event.wait(), timeout=HITL_TIMEOUT_SECONDS)
+                        decision = holder.get("decision", "approve")
+                        print(f"[EXECUTE] HITL resumed: {pause_id} → {decision}")
+                        
+                        if decision == "reject":
+                            yield _sse_event("hitl_rejected", node_id, "Ejecución cancelada por el usuario", progress, agent_name="Revisión Humana")
+                            yield _sse_event("done", "graph", json.dumps({
+                                "agents_executed": list(agent_outputs.keys()),
+                                "total_nodes": total_steps,
+                                "cancelled_at": node_id,
+                                "reason": "hitl_rejected",
+                            }), progress, agent_name="Cancelado")
+                            return  # Stop the stream
+                        
+                        yield _sse_event("hitl_approved", node_id, "Aprobado — continuando", progress, agent_name="Revisión Humana")
+                        
+                    except asyncio.TimeoutError:
+                        yield _sse_event("hitl_timeout", node_id, "Revisión abandonada (timeout 30 min)", progress, agent_name="Revisión Humana")
+                        yield _sse_event("done", "graph", json.dumps({
+                            "agents_executed": list(agent_outputs.keys()),
+                            "total_nodes": total_steps,
+                            "cancelled_at": node_id,
+                            "reason": "hitl_timeout",
+                        }), progress, agent_name="Timeout")
+                        return  # Stop the stream
+                    finally:
+                        _pause_events.pop(pause_id, None)
                 
                 # ═══ ENTREGA NODE ═══
                 elif node_type == "entrega":
@@ -284,19 +332,48 @@ async def graph_execute(request: GraphExecuteRequest, background_tasks: Backgrou
 
 
 # ═══════════════════════════════════════════════════════════════
+# POST /graph/resume  (HITL approve/reject)
+# ═══════════════════════════════════════════════════════════════
+
+@graph_router.post("/resume")
+async def graph_resume(request: GraphResumeRequest):
+    """Resume a paused graph execution after HITL review.
+    
+    The frontend receives a `pause_id` in the `hitl_pause` SSE event,
+    then POSTs here with the decision to unblock the stream.
+    """
+    entry = _pause_events.get(request.pause_id)
+    if not entry:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Pause '{request.pause_id}' not found — may have timed out or already resumed"
+        )
+    
+    event, holder = entry
+    holder["decision"] = request.decision
+    event.set()
+    
+    print(f"[GRAPH/RESUME] {request.pause_id} → {request.decision}")
+    return {"status": "resumed", "decision": request.decision}
+
+
+# ═══════════════════════════════════════════════════════════════
 # HELPER FUNCTIONS
 # ═══════════════════════════════════════════════════════════════
 
-def _sse_event(event: str, node_id: str, content: str, progress: float, agent_name: str = "") -> str:
+def _sse_event(event: str, node_id: str, content: str, progress: float, agent_name: str = "", pause_id: Optional[str] = None) -> str:
     """Format an SSE event as a string."""
-    data = json.dumps({
+    payload = {
         "event": event,
         "node_id": node_id,
         "agent_name": agent_name,
         "content": content,
         "progress": round(progress, 2),
         "timestamp": time.time(),
-    }, ensure_ascii=False)
+    }
+    if pause_id:
+        payload["pause_id"] = pause_id
+    data = json.dumps(payload, ensure_ascii=False)
     return f"data: {data}\n\n"
 
 
