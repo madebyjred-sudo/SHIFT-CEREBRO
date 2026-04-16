@@ -5,6 +5,7 @@ from langchain_openai import ChatOpenAI
 MODEL_MAP = {
     "Shifty 2.0 by Shift AI": "anthropic/claude-sonnet-4.6",
     "Claude Sonnet 4.6": "anthropic/claude-sonnet-4.6",
+    "claude-sonnet-4-6": "anthropic/claude-sonnet-4.6",
     "Gemini 3.1 Flash Lite": "google/gemini-3.1-flash-lite-preview",
     "DeepSeek V3.2": "deepseek/deepseek-v3.2",
     "Gemini 3.1 Pro": "google/gemini-3.1-pro-preview",
@@ -34,6 +35,7 @@ def get_llm(model_name: str = "Claude 3.5 Sonnet"):
         model=openrouter_model,
         openai_api_key=api_key,
         openai_api_base=os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"),
+        max_tokens=4096,  # Cap to avoid OpenRouter 402 errors (default was 65536)
         default_headers={
             "HTTP-Referer": "https://shiftpn.com",
             "X-Title": "Shift Lab Legio Digitalis",

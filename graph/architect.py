@@ -325,8 +325,11 @@ async def generate_graph(
     formatted_message = _format_user_message(user_message, current_graph)
     messages.append(HumanMessage(content=formatted_message))
     
-    # Invoke LLM
+    # Architect-specific LLM: capped at 4000 tokens, temp 0.3 for structural consistency
+    # Uses OpenRouter model mapping via get_llm, then overrides max_tokens
     architect_llm = get_llm(model)
+    architect_llm.max_tokens = 4000
+    architect_llm.temperature = 0.3
     
     MAX_RETRIES = 2
     last_error = None
