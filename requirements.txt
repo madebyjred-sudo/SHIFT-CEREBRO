@@ -11,6 +11,12 @@ langchain-openai>=0.0.5
 langgraph>=0.0.20
 openai>=1.0.0  # For DALL-E image generation
 
+# MCP (Model Context Protocol) — portable tool servers
+mcp>=1.0.0
+
+# YAML parsing for agent skill files
+pyyaml>=6.0
+
 # Database
 pymysql>=1.1.0
 cryptography>=41.0.0  # Required for MySQL SSL connections
