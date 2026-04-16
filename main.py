@@ -5,10 +5,10 @@ Entry point: mounts all routers, configures CORS, starts uvicorn.
 Architecture (post-refactor):
   config/       → database.py, models.py
   agents/       → skills/*.yaml, registry.py, context.py
-  graph/        → state.py, nodes.py, router.py, web_search.py, builder.py, synthesizer.py
+  graph/        → state.py, nodes.py, router.py, web_search.py, builder.py, synthesizer.py, architect.py
   peaje/        → router.py, extractor.py, ingest.py
   punto_medio_pkg/ → router.py
-  adapters/     → studio_adapter.py, embed_adapter.py, export_adapter.py
+  adapters/     → studio_adapter.py, embed_adapter.py, export_adapter.py, graph_adapter.py
   (standalone)  → punto_medio.py, pii_scrubber.py, tenant_constitution.py, tenant_api.py, tools/
 """
 import os
@@ -46,6 +46,7 @@ from punto_medio_pkg.router import punto_medio_router
 from adapters.studio_adapter import studio_router
 from adapters.export_adapter import export_router
 from adapters.embed_adapter import embed_router
+from adapters.graph_adapter import graph_router
 
 app.include_router(tenant_router)
 app.include_router(peaje_router)
@@ -53,6 +54,7 @@ app.include_router(punto_medio_router)
 app.include_router(studio_router)
 app.include_router(export_router)
 app.include_router(embed_router)
+app.include_router(graph_router)
 
 # ═══════════════════════════════════════════════════════════════
 # HEALTH ENDPOINT
@@ -64,10 +66,10 @@ async def health():
     return {
         "status": "healthy",
         "service": "shift-cerebro-swarm-v3-legio-digitalis",
-        "version": "v3.1.0-mcp",
+        "version": "v3.2.0-architect",
         "agents_count": len(AGENTS),
         "agents": [info["name"] for info in AGENTS.values()],
-        "features": ["langgraph_statgraph", "llm_router", "multi_agent_sequential", "synthesizer", "embed_copilot", "mcp_servers", "dynamic_rag", "pii_scrubber", "taxonomy_validation", "debate_ingestion", "punto_medio", "document_generation"]
+        "features": ["shifty_architect", "graph_generate", "graph_execute_sse", "langgraph_statgraph", "llm_router", "multi_agent_sequential", "synthesizer", "embed_copilot", "mcp_servers", "dynamic_rag", "pii_scrubber", "taxonomy_validation", "debate_ingestion", "punto_medio", "document_generation"]
     }
 
 
