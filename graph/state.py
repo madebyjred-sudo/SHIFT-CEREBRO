@@ -1,6 +1,7 @@
 """Graph State — SwarmState TypedDict and request/response Pydantic models.
 v2.0: Extended with execution_plan and current_step for LangGraph multi-agent flows."""
 from typing import List, Optional, Annotated, TypedDict, Dict, Any
+from typing_extensions import NotRequired
 from pydantic import BaseModel, field_validator
 from langchain_core.messages import BaseMessage
 
@@ -29,6 +30,8 @@ class SwarmState(TypedDict):
     user_metadata: Optional[Dict[str, Any]]
     router_reasoning: str
     router_confidence: float
+    session_id: NotRequired[str]        # NUEVO — para el peaje_node
+    last_response: NotRequired[str]     # NUEVO — reservado para futuro
 
 
 class ChatMessage(BaseModel):

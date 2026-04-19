@@ -13,7 +13,6 @@ from graph.state import SwarmState, ChatRequest, ChatMessage, DebateDashboardReq
 from graph.router import determine_agent_from_message, route_with_llm
 from graph.builder import get_studio_graph
 from graph.web_search import perform_web_search, process_attachments
-from peaje.ingest import process_auto_ingest
 from punto_medio import get_dynamic_rag, SEED_TENANT_CONTEXTS
 from tenant_constitution import get_tenant_context_with_fallback
 
@@ -129,6 +128,7 @@ async def swarm_chat(request: ChatRequest, background_tasks: BackgroundTasks):
         # ═══════════════════════════════════════════════════════════════
         # GRAPH INVOCATION (v2.0 — LangGraph StateGraph)
         # ═══════════════════════════════════════════════════════════════
+        safe_session_id = request.session_id or f"auto_{int(time.time())}"
         graph = get_studio_graph()
         
         initial_state: SwarmState = {
@@ -144,6 +144,7 @@ async def swarm_chat(request: ChatRequest, background_tasks: BackgroundTasks):
             "user_metadata": request.user_metadata,
             "router_reasoning": router_reasoning,
             "router_confidence": router_confidence,
+            "session_id": safe_session_id,
         }
         
         # Invoke the compiled graph (async)
@@ -158,21 +159,8 @@ async def swarm_chat(request: ChatRequest, background_tasks: BackgroundTasks):
         
         final_agent = result_state.get("active_agent", target_agent)
         
-        # ═══════════════════════════════════════════════════════════════
-        # AUTO-INGESTION (BACKGROUND)
-        # ═══════════════════════════════════════════════════════════════
-        safe_session_id = request.session_id or f"auto_{int(time.time())}"
-        background_tasks.add_task(
-            process_auto_ingest,
-            safe_tenant_id,
-            safe_session_id,
-            final_agent,
-            request.messages,
-            final_msg
-        )
-        
         agents_used = result_state.get("execution_plan", [target_agent])
-        print(f"[SWARM] ✓ Response from {final_agent} | Agents used: {agents_used} | Auto-ingest queued")
+        print(f"[SWARM] ✓ Response from {final_agent} | Agents used: {agents_used} | Graph completed")
         
         return {
             "content": final_msg,

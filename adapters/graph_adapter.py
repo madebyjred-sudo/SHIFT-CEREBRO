@@ -21,7 +21,6 @@ from graph.architect import generate_graph
 from graph.nodes import create_agent_node_with_model
 from graph.synthesizer import synthesizer_node
 from graph.web_search import perform_web_search
-from peaje.ingest import process_auto_ingest
 from punto_medio import get_dynamic_rag
 from tenant_constitution import get_tenant_context_with_fallback
 

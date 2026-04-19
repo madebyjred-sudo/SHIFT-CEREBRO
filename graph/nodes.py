@@ -41,6 +41,9 @@ def search_code_tool(query: str, file_pattern: str = "*"):
 # Combine all tools: system tools + document tools + extended tools
 tools = [write_file_tool, read_file_tool, execute_command_tool, search_code_tool] + ALL_TOOLS
 
+# Catálogo por nombre — para resolución en tool_map.get_tools_for_agent
+TOOL_CATALOG = {t.name: t for t in tools}
+
 
 def create_agent_node_with_model(agent_id: str, model_name: str, tenant_id: str = "shift", user_metadata: dict = None):
     """Factory function para crear nodos de agentes con modelo específico e inyección de RAG/Tenant DINÁMICO + Identity User."""
@@ -81,10 +84,14 @@ def create_agent_node_with_model(agent_id: str, model_name: str, tenant_id: str 
                 conn.close()
 
         # Define tools based on security mode
-        active_tools = tools
+        from graph.tool_map import get_tools_for_agent
+        active_tools = get_tools_for_agent(
+            agent_id=agent_id,
+            agent_info=agent_info,
+            read_only=read_only,
+            tool_catalog=TOOL_CATALOG,
+        )
         if read_only:
-            # Block write and execute tools
-            active_tools = [read_file_tool, search_code_tool]
             print(f"[SECURITY] Read-only mode active for {tid}. Write/Execute tools blocked.")
 
         # Detectar si estamos en Modo Nodos por parte del UI
@@ -193,10 +200,13 @@ def create_async_agent_node(agent_id: str, model_name: str, tenant_id: str = "sh
                 conn.close()
 
         # Define tools based on security mode
-        active_tools = tools
-        if read_only:
-            # Block write and execute tools
-            active_tools = [read_file_tool, search_code_tool]
+        from graph.tool_map import get_tools_for_agent
+        active_tools = get_tools_for_agent(
+            agent_id=agent_id,
+            agent_info=agent_info,
+            read_only=read_only,
+            tool_catalog=TOOL_CATALOG,
+        )
 
         system_content = f"""
 {SHIFT_LAB_CONTEXT}

@@ -15,7 +15,6 @@ from graph.state import SwarmState, ChatMessage
 from graph.router import route_with_llm, determine_agent_from_message
 from graph.builder import get_embed_graph
 from graph.web_search import perform_web_search
-from peaje.ingest import process_auto_ingest
 from punto_medio import get_dynamic_rag
 
 
@@ -38,6 +37,7 @@ class EmbedChatRequest(BaseModel):
     # Embed-specific: context about the host tool
     host_context: Optional[str] = None
     user_metadata: Optional[dict] = None
+    tool_domains: Optional[List[str]] = None
 
 
 class EmbedConfigResponse(BaseModel):
@@ -107,6 +107,7 @@ async def embed_chat(request: EmbedChatRequest, background_tasks: BackgroundTask
             host_ctx = f"\n\n[HOST TOOL CONTEXT]:\n{request.host_context}\nINSTRUCCIÓN: Adapta tu respuesta al contexto de la herramienta donde estás embebido."
         
         context_combined = web_context + host_ctx
+        safe_session_id = request.session_id or f"embed_{int(time.time())}"
         
         # Build and invoke the embed graph
         graph = get_embed_graph(active_agents=active_agents)
@@ -123,6 +124,7 @@ async def embed_chat(request: EmbedChatRequest, background_tasks: BackgroundTask
             "user_metadata": request.user_metadata,
             "router_reasoning": router_reasoning,
             "router_confidence": router_confidence,
+            "session_id": safe_session_id,
         }
         
         result_state = await graph.ainvoke(initial_state)
@@ -135,17 +137,6 @@ async def embed_chat(request: EmbedChatRequest, background_tasks: BackgroundTask
             final_msg = last.content if hasattr(last, 'content') else str(last)
         
         final_agent = result_state.get("active_agent", agent_id)
-        
-        # Auto-ingest
-        safe_session_id = request.session_id or f"embed_{int(time.time())}"
-        background_tasks.add_task(
-            process_auto_ingest,
-            safe_tenant_id,
-            safe_session_id,
-            final_agent,
-            request.messages,
-            final_msg
-        )
         
         print(f"[EMBED] ✓ Response from {final_agent} | Active agents: {active_agents}")
         

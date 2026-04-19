@@ -8,6 +8,7 @@ from graph.state import SwarmState
 from graph.router import arouter_node
 from graph.nodes import create_agent_node_with_model
 from graph.synthesizer import synthesizer_node
+from graph.peaje_node import peaje_node
 
 
 def _agent_dispatcher(state: SwarmState) -> dict:
@@ -125,6 +126,8 @@ def build_cerebro_graph(
     
     if include_synthesizer:
         graph.add_node("synthesizer", synthesizer_node)
+        
+    graph.add_node("peaje", peaje_node)
     
     # Add edges
     # START → router
@@ -141,20 +144,22 @@ def build_cerebro_graph(
             {
                 "agent": "agent",        # Loop back for next agent in plan
                 "synthesize": "synthesizer",  # Multi-agent → synthesize
-                "end": END,              # Single agent → done
+                "end": "peaje",              # Single agent → done
             }
         )
-        graph.add_edge("synthesizer", END)
+        graph.add_edge("synthesizer", "peaje")
     else:
         graph.add_conditional_edges(
             "agent",
             _should_continue_agents,
             {
                 "agent": "agent",
-                "synthesize": END,  # No synthesizer available → end
-                "end": END,
+                "synthesize": "peaje",  # No synthesizer available → end
+                "end": "peaje",
             }
         )
+        
+    graph.add_edge("peaje", END)
     
     # Compile
     compiled = graph.compile()

@@ -136,57 +136,6 @@ def determine_agent_from_message(message_content: str) -> str:
     return "shiftai"
 
 
-def router_node(state: SwarmState) -> SwarmState:
-    """LangGraph node: Routes the conversation to the appropriate agent(s).
-    This is a SYNC wrapper — the graph builder will handle async invocation."""
-    import asyncio
-    
-    # Get the last user message
-    last_message = ""
-    for msg in reversed(state["messages"]):
-        if hasattr(msg, 'content') and isinstance(msg.content, str):
-            last_message = msg.content
-            break
-    
-    # Check for preferred agent override
-    # (This is set by the adapter before graph invocation)
-    if state.get("execution_plan") and len(state["execution_plan"]) > 0:
-        # Plan was pre-set by the adapter (preferred_agent or nodes_mode)
-        print(f"[ROUTER NODE] Pre-set plan: {state['execution_plan']}")
-        return state
-    
-    # Run async router in sync context
-    try:
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            # We're inside an async context (FastAPI) — use the event loop
-            import concurrent.futures
-            with concurrent.futures.ThreadPoolExecutor() as pool:
-                result = loop.run_in_executor(pool, lambda: asyncio.run(route_with_llm(last_message)))
-                # Can't await here in sync — use fallback
-                raise RuntimeError("Use async path")
-        else:
-            result = asyncio.run(route_with_llm(last_message))
-    except Exception:
-        # Fallback for sync context
-        fallback = determine_agent_from_message(last_message)
-        result = {
-            "agent_id": fallback,
-            "execution_plan": [fallback],
-            "confidence": 0.4,
-            "reasoning": f"Sync fallback: {fallback}",
-        }
-    
-    return {
-        **state,
-        "execution_plan": result["execution_plan"],
-        "current_step": 0,
-        "active_agent": result["agent_id"],
-        "router_reasoning": result["reasoning"],
-        "router_confidence": result["confidence"],
-    }
-
-
 async def arouter_node(state: SwarmState) -> dict:
     """Async LangGraph node: Routes using LLM-as-router.
     Used when the graph is invoked with ainvoke()."""

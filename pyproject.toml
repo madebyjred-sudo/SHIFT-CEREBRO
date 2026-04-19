@@ -1,0 +1,109 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "cerebro"
+version = "0.1.0"
+description = "In-process SDK for the CEREBRO multi-agent AI system by Shift AI"
+requires-python = ">=3.10"
+readme = "README.md"
+license = {text = "Proprietary"}
+authors = [
+    {name = "Shift AI", email = "dev@shift.com.co"},
+]
+
+dependencies = [
+    # LangChain & AI
+    "langchain>=0.1.0",
+    "langchain-openai>=0.0.5",
+    "langgraph>=0.0.20",
+    "openai>=1.0.0",
+    # MCP protocol
+    "mcp>=1.0.0",
+    # YAML parsing for agent skill files
+    "pyyaml>=6.0",
+    # Database
+    "pymysql>=1.1.0",
+    "cryptography>=41.0.0",
+    # Environment
+    "python-dotenv>=1.0.0",
+    # Data validation
+    "pydantic>=2.5.0",
+    "typing-extensions>=4.0.0",
+    # Async HTTP
+    "httpx>=0.25.0",
+    # Document generation tools
+    "python-docx>=1.1.0",
+    "reportlab>=4.0.0",
+    "python-pptx>=0.6.21",
+    # Data analysis & visualization
+    "pandas>=2.0.0",
+    "matplotlib>=3.8.0",
+    "numpy>=1.24.0",
+    # NLP & sentiment
+    "textblob>=0.17.1",
+    # Utility tools
+    "qrcode[pil]>=7.4.0",
+    "wordcloud>=1.9.0",
+    "Pillow>=10.0.0",
+    # Document extras
+    "pypdf>=4.0.0",
+    "openpyxl>=3.1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-asyncio>=0.21",
+    "pytest-mock>=3.10",
+    "ruff>=0.1.0",
+]
+server = [
+    "fastapi>=0.104.0",
+    "uvicorn[standard]>=0.24.0",
+    "a2wsgi>=1.7.0",
+]
+
+# ═══════════════════════════════════════════════════════════════
+# Hatchling build configuration
+# ═══════════════════════════════════════════════════════════════
+
+[tool.hatch.build.targets.wheel]
+packages = [
+    "cerebro",
+    "graph",
+    "agents",
+    "peaje",
+    "tools",
+    "config",
+    "punto_medio_pkg",
+]
+
+# Top-level modules that must travel with the package
+[tool.hatch.build.targets.wheel.force-include]
+"tenant_constitution.py" = "tenant_constitution.py"
+"tenant_api.py" = "tenant_api.py"
+"punto_medio.py" = "punto_medio.py"
+"pii_scrubber.py" = "pii_scrubber.py"
+
+[tool.hatch.build.targets.sdist]
+exclude = [
+    "adapters/",
+    "tests/",
+    "migrations/",
+    "mcp_servers/",
+    "main.py",
+    "main_monolith_backup.py",
+    "*.sql",
+    "venv/",
+    "__pycache__/",
+    ".git/",
+    ".env",
+    ".env.example",
+    "generated_documents/",
+    "railway.toml",
+    "runtime.txt",
+    ".pytest_cache/",
+    ".DS_Store",
+]
