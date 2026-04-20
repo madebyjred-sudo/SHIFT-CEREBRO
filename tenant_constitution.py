@@ -32,11 +32,9 @@ SEED_TENANT_CONTEXTS = {
         "industry": "tech_saas",
         "tone_voice": "Bold-Disruptivo",
         "brand_archetype": "The Explorer",
-        "negative_constraints": ["modelo de lenguaje", "como agente", "swarm", "AI dice", "no puedo"],
+        "negative_constraints": ["modelo de lenguaje", "como agente", "como IA", "AI dice", "no puedo", "sistema interno", "pipeline", "arquitectura"],
         "internal_jargon": {
-            "Punto Medio": "Memoria institucional materializada",
-            "El Peaje": "Sistema de extracción de insights",
-            "Shift Way": "Metodología de respuesta"
+            "Shift Way": "Metodología de respuesta estratégica"
         }
     },
     "garnier": {

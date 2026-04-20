@@ -127,7 +127,7 @@ INSTRUCCIÓN OBLIGATORIA: Dirígete al usuario por su nombre. Adapta tu tono, co
 # CONTEXTO CORPORATIVO ({tid.upper()})
 {tenant_context}
 
-# MEMORIA INSTITUCIONAL (PUNTO MEDIO)
+# CONTEXTO ORGANIZACIONAL RELEVANTE
 {punto_medio_injection}
 
 {user_profile_context}
@@ -143,7 +143,7 @@ Nombre: {agent_info['name']}
 2. **Formato Markdown:** Usa `##` para secciones, `**negritas**` para conceptos clave, bloques de código para comandos/datos estructurados.
 3. **Longitud Adaptativa:** Preguntas simples → respuesta directa y breve. Solicitudes estratégicas/técnicas → respuesta estructurada y exhaustiva.
 4. **Herramientas:** {"Tienes acceso a read_file_tool, search_code_tool." if read_only else "Tienes acceso a write_file_tool, read_file_tool, execute_command_tool, search_code_tool."} Úsalas inmediatamente si la intención del usuario es clara; no pidas permiso innecesario.
-5. **Invisible Swarm:** Está PROHIBIDO decir "como modelo de lenguaje", "como agente del swarm", "consultando a mis compañeros" o cualquier referencia al sistema multi-agente. Eres {agent_info['name']} de {tid.upper()}, punto.
+5. **Identidad inquebrantable:** Está PROHIBIDO decir "como modelo de lenguaje", "como IA", "consultando a mis compañeros", o cualquier referencia a sistemas internos, pipelines, arquitectura o componentes técnicos. Eres {agent_info['name']} de {tid.upper()}, punto.
 6. **Protocolo de Incertidumbre:** Si no tienes visibilidad sobre un dato específico de {tid.upper()}, di: "No tengo visibilidad sobre [X] en este momento. ¿Quieres que proceda con una estimación basada en mejores prácticas del sector?"
 7. **Accionabilidad Obligatoria:** Toda respuesta no-trivial debe cerrar con un Next Step concreto o pregunta de seguimiento.
 8. **Continuidad Conversacional:** El historial puede contener respuestas previas de otros consultores del equipo, marcadas como `[Nombre]: texto`. Aprovecha ese contexto para dar continuidad — no repitas lo que ya se dijo, complementa o profundiza.
@@ -214,7 +214,7 @@ def create_async_agent_node(agent_id: str, model_name: str, tenant_id: str = "sh
 # CONTEXTO CORPORATIVO ({tid.upper()})
 {tenant_context}
 
-# MEMORIA INSTITUCIONAL (PUNTO MEDIO)
+# CONTEXTO ORGANIZACIONAL RELEVANTE
 {punto_medio_injection}
 
 # TU ROL ESPECIALIZADO
@@ -226,18 +226,42 @@ Nombre: {agent_info['name']}
 2. **Formato Markdown:** Usa `##` para secciones, `**negritas**` para conceptos clave, bloques de código para comandos/datos estructurados.
 3. **Longitud Adaptativa:** Preguntas simples → respuesta directa y breve. Solicitudes estratégicas/técnicas → respuesta estructurada y exhaustiva.
 4. **Herramientas:** {"Tienes acceso a read_file_tool, search_code_tool." if read_only else "Tienes acceso a write_file_tool, read_file_tool, execute_command_tool, search_code_tool."} Úsalas inmediatamente si la intención del usuario es clara.
-5. **Invisible Swarm:** Está PROHIBIDO decir "como modelo de lenguaje", "como agente del swarm", "consultando a mis compañeros" o cualquier referencia al sistema multi-agente. Eres {agent_info['name']} de {tid.upper()}, punto.
+5. **Identidad inquebrantable:** Está PROHIBIDO decir "como modelo de lenguaje", "como IA", "consultando a mis compañeros", o cualquier referencia a sistemas internos, pipelines, arquitectura o componentes técnicos. Eres {agent_info['name']} de {tid.upper()}, punto.
 6. **Protocolo de Incertidumbre:** Si no tienes visibilidad sobre un dato específico de {tid.upper()}, di: "No tengo visibilidad sobre [X] en este momento. ¿Quieres que proceda con una estimación basada en mejores prácticas del sector?"
 7. **Accionabilidad Obligatoria:** Toda respuesta no-trivial debe cerrar con un Next Step concreto o pregunta de seguimiento.
 """
         
         agent_llm = get_llm(model_name)
         bound_llm = agent_llm.bind_tools(active_tools)
-        messages = [SystemMessage(content=system_content)] + state["messages"]
-        
+
+        # Multi-agent handoff fix: rebuild messages as [user_query + prior_agents_context]
+        # so every agent sees a conversation that ends with a HumanMessage (required by
+        # Azure-hosted Claude / providers that reject assistant prefill) and drops any
+        # orphan tool_use blocks from prior agents' AIMessages.
+        from langchain_core.messages import HumanMessage as _HM
+        original_user = next((m for m in state["messages"] if m.__class__.__name__ == "HumanMessage"), None)
+        prior_outputs = state.get("agent_outputs", {})
+        if prior_outputs:
+            prior_ctx = "\n\n---\n\n".join(
+                f"**Perspectiva previa de {aid.upper()}:**\n{str(out)[:1800]}"
+                for aid, out in prior_outputs.items()
+            )
+            composed = _HM(
+                content=(
+                    (original_user.content if original_user else "")
+                    + f"\n\n---CONTEXTO MULTI-AGENTE---\n{prior_ctx}\n---FIN CONTEXTO---\n\n"
+                    "Aporta tu perspectiva específica. No repitas lo ya dicho."
+                )
+            )
+            call_messages = [SystemMessage(content=system_content), composed]
+        else:
+            call_messages = [SystemMessage(content=system_content)] + (
+                [original_user] if original_user else state["messages"]
+            )
+
         # ✅ ASYNC invoke — does NOT block the event loop
-        response = await bound_llm.ainvoke(messages)
-        
+        response = await bound_llm.ainvoke(call_messages)
+
         return {
             "messages": state["messages"] + [response],
             "active_agent": agent_id,
