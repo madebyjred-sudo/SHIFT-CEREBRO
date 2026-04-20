@@ -48,6 +48,7 @@ from adapters.export_adapter import export_router
 from adapters.embed_adapter import embed_router
 from adapters.graph_adapter import graph_router
 from adapters.openai_adapter import openai_router
+from adapters.openai_proxy import v1_router
 from adapters.agents_market_adapter import market_router
 
 app.include_router(tenant_router)
@@ -57,7 +58,8 @@ app.include_router(studio_router)
 app.include_router(export_router)
 app.include_router(embed_router)
 app.include_router(graph_router)
-app.include_router(openai_router)
+app.include_router(openai_router)   # Legacy /adapter/v1 (deprecated)
+app.include_router(v1_router)       # Standard /v1 (OpenAI SDK compatible)
 app.include_router(market_router)
 
 # ═══════════════════════════════════════════════════════════════
@@ -73,7 +75,7 @@ async def health():
         "version": "v3.2.0-architect",
         "agents_count": len(AGENTS),
         "agents": [info["name"] for info in AGENTS.values()],
-        "features": ["shifty_architect", "graph_generate", "graph_execute_sse", "langgraph_statgraph", "llm_router", "multi_agent_sequential", "synthesizer", "embed_copilot", "mcp_servers", "dynamic_rag", "pii_scrubber", "taxonomy_validation", "debate_ingestion", "punto_medio", "document_generation", "openai_compat_adapter", "agents_market"]
+        "features": ["shifty_architect", "graph_generate", "graph_execute_sse", "langgraph_statgraph", "llm_router", "multi_agent_sequential", "synthesizer", "embed_copilot", "mcp_servers", "dynamic_rag", "pii_scrubber", "taxonomy_validation", "debate_ingestion", "punto_medio", "document_generation", "openai_compat_adapter", "openrouter_universal_proxy", "agents_market"]
     }
 
 
