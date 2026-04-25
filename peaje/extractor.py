@@ -45,8 +45,11 @@ Debes responder ÚNICAMENTE con un JSON válido con esta estructura exacta:
     """
     
     try:
-        # Usamos el modelo GRATUITO de MiniMax en OpenRouter para no consumir saldo del Peaje
-        extraction_llm = get_llm("minimax/minimax-m2.5") 
+        # Kimi K2.6 (Moonshot): 256k context, JSON-strict, multilingual ES strong,
+        # ~$0.75/Mtok input. Replaced minimax-m2.5 (2026-04-25) — Kimi adheres to
+        # the JSON output contract more reliably and handles legal/legislative
+        # Spanish (CL2 tenant) noticeably better.
+        extraction_llm = get_llm("moonshotai/kimi-k2.6")
         result = await extraction_llm.ainvoke([SystemMessage(content=extractor_prompt)])
         
         # Limpiar posible markdown block

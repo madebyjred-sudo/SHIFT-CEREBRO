@@ -108,7 +108,7 @@ async def peaje_ingest(request: PeajeIngestRequest):
         )
         
         extraction_duration_ms = int((time.time() - extraction_start) * 1000)
-        extraction_model = "minimax/minimax-m2.5"
+        extraction_model = "moonshotai/kimi-k2.6"
         
         print(f"[EL PEAJE v2] PII Scrubbed: {scrub_result['total_pii_scrubbed']} items | "
               f"Category: {scrub_result['original_category']} → {scrub_result['validated_category']} "
@@ -296,7 +296,7 @@ async def peaje_ingest_debate(request: PeajeDebateIngestRequest):
                                 scrub_result["industry_vertical"],
                                 insight_data["sentiment"],
                                 insight_data["confidence_score"],
-                                "minimax/minimax-m2.5",
+                                "moonshotai/kimi-k2.6",
                                 scrub_result["pii_scrubbed"],
                                 "debate",
                                 i + 1,
@@ -363,7 +363,7 @@ async def peaje_ingest_debate(request: PeajeDebateIngestRequest):
                                 synth_scrub["industry_vertical"],
                                 synth_data["sentiment"],
                                 min(synth_data["confidence_score"] + 0.10, 0.99),
-                                "minimax/minimax-m2.5",
+                                "moonshotai/kimi-k2.6",
                                 synth_scrub["pii_scrubbed"],
                                 "debate",
                                 hashlib.sha256(f"{request.tenantId}:{request.sessionId}:synthesis".encode()).hexdigest(),
@@ -517,7 +517,7 @@ async def peaje_nodes(request: NodeExecutionPayload):
                                 scrub_result["industry_vertical"],
                                 insight_data["sentiment"],
                                 insight_data["confidence_score"],
-                                "minimax/minimax-m2.5",
+                                "moonshotai/kimi-k2.6",
                                 scrub_result["pii_scrubbed"],
                                 "nodes_canvas",
                                 anonymized_hash,

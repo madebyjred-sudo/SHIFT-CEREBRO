@@ -24,7 +24,7 @@ async def consolidate_endpoint():
         raise HTTPException(status_code=503, detail="Database not available")
     
     try:
-        result = await consolidate_punto_medio(conn, llm_func=get_llm('minimax/minimax-m2.5'))
+        result = await consolidate_punto_medio(conn, llm_func=get_llm('moonshotai/kimi-k2.6'))
         return result
     finally:
         conn.close()

@@ -61,7 +61,7 @@ async def process_auto_ingest(tenant_id: str, session_id: str, agent_id: str, me
                         scrub_result["industry_vertical"],
                         insight_data["sentiment"],
                         insight_data["confidence_score"],
-                        "minimax/minimax-m2.5",
+                        "moonshotai/kimi-k2.6",
                         scrub_result["pii_scrubbed"],
                         anonymized_hash
                     ))

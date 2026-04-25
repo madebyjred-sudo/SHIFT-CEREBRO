@@ -116,7 +116,7 @@ async def call_tool(name: str, arguments: dict):
                             scrub_result["industry_vertical"],
                             insight_data["sentiment"],
                             insight_data["confidence_score"],
-                            "minimax/minimax-m2.5",
+                            "moonshotai/kimi-k2.6",
                             scrub_result["pii_scrubbed"],
                             source,
                             anonymized_hash,
