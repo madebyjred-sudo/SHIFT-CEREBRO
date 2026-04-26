@@ -60,19 +60,30 @@ def _endpoint() -> str:
 
 async def _embed_one(text: str, task_type: str = "RETRIEVAL_DOCUMENT") -> list[float]:
     from google.protobuf import struct_pb2  # type: ignore
+    from google.protobuf import json_format  # type: ignore
     from google.cloud.aiplatform_v1.types import PredictRequest  # type: ignore
 
     client = _get_client()
-    instance = struct_pb2.Value()
-    instance.struct_value.update({"content": text, "task_type": task_type})
-    parameters = struct_pb2.Value()
-    parameters.struct_value.update({"outputDimensionality": VERTEX_DIM})
-
-    request = PredictRequest(
-        endpoint=_endpoint(),
-        instances=[instance],
-        parameters=parameters,
+    # Build proto Values via json_format.ParseDict (handles nested struct
+    # field types reliably across proto versions).
+    instance = json_format.ParseDict(
+        {"content": text, "task_type": task_type},
+        struct_pb2.Value(),
     )
+    parameters = json_format.ParseDict(
+        {"outputDimensionality": VERTEX_DIM},
+        struct_pb2.Value(),
+    )
+
+    # proto-plus 1.27 has a regression where passing `instances=[v]` as a
+    # kwarg to PredictRequest fails an internal iterable check. Building
+    # the request and `.append()`-ing into the repeated field afterwards
+    # sidesteps the bug.
+    request = PredictRequest()
+    request.endpoint = _endpoint()
+    request.instances.append(instance)
+    request.parameters = parameters
+
     response = await client.predict(request=request)
     pred = response.predictions[0]
     # The protobuf Struct→dict conversion path; LightRAG only cares about
@@ -109,7 +120,7 @@ async def embed_texts(
 
 # LightRAG's contract: a callable that takes list[str] and returns
 # numpy.ndarray with shape (n, dim). We wrap embed_texts and convert.
-async def lightrag_embed(texts: list[str]):
+async def _lightrag_embed_raw(texts: list[str]):
     """LightRAG-compatible embedding function. Numpy import deferred so
     importing this module is cheap on cold start."""
     import numpy as np  # type: ignore
@@ -118,7 +129,27 @@ async def lightrag_embed(texts: list[str]):
     return np.array(vectors, dtype=np.float32)
 
 
-# Tag the function with the dimensions LightRAG inspects to size its
-# vector store. Using setattr keeps mypy quiet.
-setattr(lightrag_embed, "embedding_dim", VERTEX_DIM)
-setattr(lightrag_embed, "max_token_size", 8000)
+def build_lightrag_embed():
+    """Return an `EmbeddingFunc`-wrapped callable.
+
+    LightRAG ≥1.4 introspects `embedding_func.func` to compute the inner
+    raw callable and `embedding_func.embedding_dim` for vector store
+    sizing. The wrapper class is the public contract; older LightRAG
+    versions accepted a bare async callable with `embedding_dim` set as
+    an attribute, which is what we used to do — that path now raises
+    AttributeError on `.func`. Lazy import so importing this module
+    stays cheap when LightRAG isn't installed.
+    """
+    from lightrag.utils import EmbeddingFunc  # type: ignore
+
+    return EmbeddingFunc(
+        embedding_dim=VERTEX_DIM,
+        max_token_size=8000,
+        func=_lightrag_embed_raw,
+        model_name=VERTEX_MODEL,
+    )
+
+
+# Backward-compatibility alias used elsewhere in the module. Now points
+# to the wrapper-builder rather than the raw callable.
+lightrag_embed = _lightrag_embed_raw

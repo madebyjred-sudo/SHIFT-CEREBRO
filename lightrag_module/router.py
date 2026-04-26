@@ -72,7 +72,7 @@ async def insert_chunks(req: InsertRequest):
     content hash internally; passing the same chunk twice is a no-op
     on the second call."""
     try:
-        rag = get_lightrag()
+        rag = await get_lightrag()
     except LightragNotInstalled:
         raise _503_when_missing()
 
@@ -103,7 +103,7 @@ async def query_graph(req: QueryRequest):
     """Query the graph. Returns the synthesized answer + (when possible)
     the entities/relations that contributed."""
     try:
-        rag = get_lightrag()
+        rag = await get_lightrag()
     except LightragNotInstalled:
         raise _503_when_missing()
 
@@ -142,26 +142,43 @@ async def lightrag_health():
 
     # If the package isn't installed, return a degraded but useful
     # health payload (200, not 503) so monitoring doesn't pageout.
+    chunk_count: Optional[int] = None
     try:
-        rag = get_lightrag()
+        rag = await get_lightrag()
         installed = True
-        entity_count = None
-        relation_count = None
-        # Best-effort introspection. LightRAG's internals vary by version.
-        try:
-            entity_count = await rag.entities_vdb.acount() if hasattr(rag, "entities_vdb") else None
-        except Exception:
-            pass
-        try:
-            relation_count = (
-                await rag.relationships_vdb.acount() if hasattr(rag, "relationships_vdb") else None
-            )
-        except Exception:
-            pass
+        entity_count: Optional[int] = None
+        relation_count: Optional[int] = None
+        # Best-effort introspection. nano-vectordb (LightRAG ≥1.4 default)
+        # exposes its in-memory store via the async `client_storage` property,
+        # which returns a dict with a `data` list. There's no stable public
+        # count() across versions, so we reach in. Try/except keeps the
+        # endpoint useful even if a deploy swaps in a different vector
+        # backend (Milvus, Qdrant) where this shape doesn't apply.
+        for vdb_attr, sink in (
+            ("entities_vdb", "entities"),
+            ("relationships_vdb", "relations"),
+            ("chunks_vdb", "chunks"),
+        ):
+            try:
+                vdb = getattr(rag, vdb_attr, None)
+                if vdb is None:
+                    continue
+                cs = await vdb.client_storage  # type: ignore[func-returns-value]
+                if isinstance(cs, dict) and isinstance(cs.get("data"), list):
+                    n = len(cs["data"])
+                    if sink == "entities":
+                        entity_count = n
+                    elif sink == "relations":
+                        relation_count = n
+                    elif sink == "chunks":
+                        chunk_count = n
+            except Exception:
+                pass
     except LightragNotInstalled:
         installed = False
         entity_count = None
         relation_count = None
+        chunk_count = None
 
     # Compute disk footprint of the working dir, if it exists.
     bytes_on_disk = 0
@@ -180,6 +197,7 @@ async def lightrag_health():
         "working_dir_mb": round(bytes_on_disk / (1024 * 1024), 2),
         "entity_count": entity_count,
         "relation_count": relation_count,
+        "chunk_count": chunk_count,
         "build_model": os.getenv("LIGHTRAG_BUILD_MODEL", "anthropic/claude-haiku-4.5"),
         "query_model": os.getenv("LIGHTRAG_QUERY_MODEL", "anthropic/claude-sonnet-4.6"),
     }
