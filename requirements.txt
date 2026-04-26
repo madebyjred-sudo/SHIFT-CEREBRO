@@ -103,3 +103,17 @@ pypdf>=4.0.0
 
 # For reading and writing Excel files
 openpyxl>=3.1.0
+
+# ═══════════════════════════════════════════════════════════════
+# GRAPH-AUGMENTED RAG (LightRAG)
+# ═══════════════════════════════════════════════════════════════
+# LightRAG (HK PolyU, Aug 2024). Builds entity+relation graph from
+# the SIL corpus + Reglamento. Lazy-imported by lightrag_module —
+# leave commented to ship dormant; uncomment + reinstall to enable.
+# GitHub: https://github.com/HKUDS/LightRAG
+# lightrag-hku>=1.0.0
+
+# Vertex AI client (used by lightrag_module/embeddings_adapter.py).
+# Already loaded transitively by other deps in many envs; pin
+# explicitly when LightRAG is enabled.
+# google-cloud-aiplatform>=1.60.0

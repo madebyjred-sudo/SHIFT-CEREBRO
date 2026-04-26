@@ -47,6 +47,7 @@ from adapters.studio_adapter import studio_router
 from adapters.export_adapter import export_router
 from adapters.embed_adapter import embed_router
 from adapters.graph_adapter import graph_router
+from lightrag_module.router import lightrag_router
 
 app.include_router(tenant_router)
 app.include_router(peaje_router)
@@ -55,6 +56,7 @@ app.include_router(studio_router)
 app.include_router(export_router)
 app.include_router(embed_router)
 app.include_router(graph_router)
+app.include_router(lightrag_router)
 
 # ═══════════════════════════════════════════════════════════════
 # HEALTH ENDPOINT
