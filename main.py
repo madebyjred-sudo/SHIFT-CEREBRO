@@ -48,6 +48,10 @@ from adapters.export_adapter import export_router
 from adapters.embed_adapter import embed_router
 from adapters.graph_adapter import graph_router
 from lightrag_module.router import lightrag_router
+# Generic agent + LLM invocation surface — used by Eco worker today,
+# future Sentinel agents tomorrow. Drops `geo-classifier`,
+# `social-listener`, etc. behind a stable HTTP contract.
+from agents.router import router as agents_router
 
 app.include_router(tenant_router)
 app.include_router(peaje_router)
@@ -57,6 +61,7 @@ app.include_router(export_router)
 app.include_router(embed_router)
 app.include_router(graph_router)
 app.include_router(lightrag_router)
+app.include_router(agents_router)
 
 # ═══════════════════════════════════════════════════════════════
 # HEALTH ENDPOINT
