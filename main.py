@@ -52,6 +52,9 @@ from lightrag_module.router import lightrag_router
 # future Sentinel agents tomorrow. Drops `geo-classifier`,
 # `social-listener`, etc. behind a stable HTTP contract.
 from agents.router import router as agents_router
+# Multi-app RAG retrieval (post v3 schema): each Shift app pulls its
+# own bucket + the global cross-app bucket via /v1/rag/retrieve.
+from peaje.rag_endpoints import router as rag_router
 
 app.include_router(tenant_router)
 app.include_router(peaje_router)
@@ -62,6 +65,7 @@ app.include_router(embed_router)
 app.include_router(graph_router)
 app.include_router(lightrag_router)
 app.include_router(agents_router)
+app.include_router(rag_router)
 
 # ═══════════════════════════════════════════════════════════════
 # HEALTH ENDPOINT
