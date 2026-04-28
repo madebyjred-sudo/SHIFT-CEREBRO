@@ -55,6 +55,11 @@ from agents.router import router as agents_router
 # Multi-app RAG retrieval (post v3 schema): each Shift app pulls its
 # own bucket + the global cross-app bucket via /v1/rag/retrieve.
 from peaje.rag_endpoints import router as rag_router
+# Cross-app feedback widget endpoints — receives every like/dislike/
+# chip/free_text from <cerebro-feedback> custom element. Hosted single
+# source: any app of Shift can embed the same widget by referencing
+# /widget/cerebro-feedback.js below.
+from feedback.router import router as feedback_router
 
 app.include_router(tenant_router)
 app.include_router(peaje_router)
@@ -66,6 +71,24 @@ app.include_router(graph_router)
 app.include_router(lightrag_router)
 app.include_router(agents_router)
 app.include_router(rag_router)
+app.include_router(feedback_router)
+
+# ═══════════════════════════════════════════════════════════════
+# STATIC: widget JS hosted from Cerebro itself
+#   GET /widget/cerebro-feedback.js  →  same-origin custom element
+#   served to all Shift apps. No npm publish, no app rebuild needed
+#   when the widget evolves — apps just refresh.
+# ═══════════════════════════════════════════════════════════════
+from fastapi.staticfiles import StaticFiles
+from fastapi.middleware.cors import CORSMiddleware as _CORSWidget
+import pathlib as _pathlib
+
+_widget_dir = _pathlib.Path(__file__).parent / "static" / "widget"
+if _widget_dir.is_dir():
+    app.mount("/widget", StaticFiles(directory=str(_widget_dir)), name="widget")
+    print(f"[STATIC] /widget serving {_widget_dir}")
+else:
+    print(f"[STATIC] WARN: widget dir not found: {_widget_dir}")
 
 # ═══════════════════════════════════════════════════════════════
 # HEALTH ENDPOINT

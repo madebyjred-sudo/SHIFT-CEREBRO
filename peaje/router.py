@@ -41,6 +41,18 @@ class PeajeIngestRequest(BaseModel):
     agentId: str
     messages: List[ChatMessage]
     response: str
+    # Stable identifier for the message — front-end generates it
+    # (uuid o agente:turn:hash) y se lo pasa al widget de feedback
+    # para que pueda anclar likes/dislikes al mismo turn.
+    # Si no viene, lo generamos del session+timestamp (anclaje débil).
+    message_id: Optional[str] = None
+    # Modelo upstream que generó la respuesta — se persiste con el
+    # training pair para poder filtrar por legal_status al exportar.
+    upstream_model: Optional[str] = None
+    # Si el caller tiene el system_prompt completo del agente (Studio
+    # lo conoce porque arma el prompt), puede pasarlo. Si no, lo
+    # resolvemos desde el AGENTS registry cargando el YAML del agentId.
+    system_prompt_override: Optional[str] = None
 
 
 class PeajeDebateIngestRequest(BaseModel):
@@ -271,12 +283,122 @@ async def peaje_ingest(request: PeajeIngestRequest):
                     except Exception as route_err:
                         print(f"[EL PEAJE v2 ROUTER] {route_err}")
 
+                # ═══ STEP 7: training pair capture (post v3.1) ═══
+                # Persist the FULL turn (system, user, response) en
+                # cerebro_training_pairs para futuro fine-tune. Se
+                # ancla via message_id que el frontend usa para el
+                # widget <cerebro-feedback>. Best-effort — falla
+                # silencioso si la tabla no existe (deploy pre-schema).
+                try:
+                    from agents.registry import AGENTS
+                    import hashlib as _h
+                    import json as _j
+
+                    msg_id = request.message_id or _h.sha256(
+                        f"{request.tenantId}:{request.sessionId}:{request.agentId}:"
+                        f"{datetime.now().isoformat()}".encode()
+                    ).hexdigest()[:64]
+
+                    sys_prompt = request.system_prompt_override
+                    if not sys_prompt:
+                        agent_info = AGENTS.get(request.agentId, {})
+                        sys_prompt = agent_info.get("skill", "") or ""
+
+                    last_user_msg = ""
+                    for m in reversed(request.messages):
+                        if m.role == "user":
+                            last_user_msg = m.content
+                            break
+
+                    sys_hash = _h.sha256(sys_prompt.encode("utf-8")).hexdigest()
+                    upstream = request.upstream_model or extraction_model
+
+                    # Resolve skill_version_id (may insert snapshot if new)
+                    skill_version_id = None
+                    with conn.cursor() as scur:
+                        try:
+                            scur.execute(
+                                "SELECT id FROM cerebro_skills_versions "
+                                "WHERE agent_id=%s AND skill_prompt_hash=%s",
+                                (request.agentId, sys_hash),
+                            )
+                            row = scur.fetchone()
+                            if row:
+                                skill_version_id = row.get("id") if isinstance(row, dict) else row[0]
+                            else:
+                                # Snapshot the unseen prompt
+                                ainfo = AGENTS.get(request.agentId, {})
+                                scur.execute(
+                                    "INSERT INTO cerebro_skills_versions "
+                                    "(agent_id, version, skill_prompt_hash, skill_prompt, "
+                                    " role, pod, pod_name, keywords) "
+                                    "VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
+                                    (
+                                        request.agentId,
+                                        str(ainfo.get("version", "1.0.0")),
+                                        sys_hash,
+                                        sys_prompt,
+                                        ainfo.get("role", ""),
+                                        ainfo.get("pod"),
+                                        ainfo.get("pod_name", ""),
+                                        _j.dumps(ainfo.get("keywords", [])),
+                                    ),
+                                )
+                                skill_version_id = scur.lastrowid
+                        except Exception as sv_err:
+                            print(f"[TRAINING] skill_version resolution failed: {sv_err}")
+
+                        # Legal flag: kimi/qwen/llama → unrestricted;
+                        # claude/openai outputs → tos_restricted.
+                        legal_status = "unrestricted"
+                        if upstream and any(t in upstream.lower() for t in ("claude", "openai", "gpt-")):
+                            legal_status = "tos_restricted"
+
+                        try:
+                            scur.execute(
+                                """
+                                INSERT INTO cerebro_training_pairs
+                                (insight_id, message_id, app_id, tenant_id, agent_id,
+                                 skill_version_id, system_prompt, user_message,
+                                 user_message_scrubbed, assistant_response,
+                                 upstream_model, legal_status)
+                                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                                ON DUPLICATE KEY UPDATE updated_at = updated_at
+                                """,
+                                (
+                                    insight_id,
+                                    msg_id,
+                                    request.app_id,
+                                    request.tenantId,
+                                    request.agentId,
+                                    skill_version_id,
+                                    sys_prompt[:65535],
+                                    last_user_msg[:65535],
+                                    scrub_result["scrubbed_text"][:65535],
+                                    request.response[:16000000],
+                                    upstream,
+                                    legal_status,
+                                ),
+                            )
+                            conn.commit()
+                        except Exception as tp_err:
+                            # Tabla puede no existir aún (deploy pre-schema). Log + continue.
+                            print(f"[TRAINING] training_pairs insert skipped: {tp_err}")
+                            conn.rollback()
+                except Exception as cap_err:
+                    print(f"[TRAINING] capture wrapper failed: {cap_err}")
+
+                # message_id se devuelve para que el frontend pueda
+                # anclar el widget <cerebro-feedback> al mismo turn.
+                _msg_id_out = locals().get("msg_id")
+
                 return {
                     "status": "ingested",
                     "version": "v3",
                     "app_id": request.app_id,
                     "tenant": request.tenantId,
                     "insight_id": insight_id,
+                    "message_id": _msg_id_out,
                     "category": scrub_result["validated_category"],
                     "sub_category": scrub_result["sub_category"],
                     "industry_vertical": scrub_result["industry_vertical"],
