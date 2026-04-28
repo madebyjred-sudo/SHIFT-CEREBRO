@@ -46,10 +46,12 @@ from config.models import get_llm
 ROUTER_AGENT_ID = "insight-router"
 ROUTER_VERSION = "1.0.0"
 
-# Modelo por defecto para clasificación. Cheap + JSON-stable.
+# Modelo por defecto para clasificación. Kimi K2.6 = mismo modelo que
+# usa el extractor (peaje/extractor.py); coherencia de criterio + JSON
+# estable + ya está cacheado/quoted en OpenRouter para Cerebro.
 ROUTER_MODEL = os.getenv(
     "PEAJE_ROUTER_MODEL",
-    "google/gemini-3.1-flash-lite-preview",
+    "moonshotai/kimi-k2.6",
 )
 
 # Umbrales de confianza para review automático
