@@ -1,4 +1,15 @@
-"""Peaje Router — FastAPI endpoints for El Peaje insight ingestion flywheel."""
+"""Peaje Router — FastAPI endpoints for El Peaje insight ingestion flywheel.
+
+Post v3 multi-app: every ingest endpoint accepts an `app_id`
+('cl2'|'eco'|'studio'|'sentinel'). Default 'cl2' for back-compat
+with legacy CL2 callers that haven't been updated. Studio passes
+'studio'; Eco worker passes 'eco'; Sentinel will pass 'sentinel'.
+
+The app_id flows into:
+  - peaje_insights.app_id (column added in schema v3)
+  - insight-router agent (decides target bucket + global promotion)
+  - peaje_router_decisions audit
+"""
 import json
 import hashlib
 import time
@@ -10,6 +21,7 @@ from pydantic import BaseModel
 from config.database import get_db_connection
 from graph.state import ChatMessage
 from peaje.extractor import extract_insight_data_async
+from peaje.insight_router_client import route_insight
 from pii_scrubber import full_scrub_pipeline, check_deduplication
 
 peaje_router = APIRouter(tags=["peaje"])
@@ -20,6 +32,10 @@ peaje_router = APIRouter(tags=["peaje"])
 # ═══════════════════════════════════════════════════════════════
 
 class PeajeIngestRequest(BaseModel):
+    # Multi-app dimension. Default 'cl2' so legacy callers continue
+    # to work without redeploy. Studio sends 'studio', Eco sends
+    # 'eco', Sentinel sends 'sentinel'.
+    app_id: str = "cl2"
     tenantId: str
     sessionId: str
     agentId: str
@@ -28,6 +44,7 @@ class PeajeIngestRequest(BaseModel):
 
 
 class PeajeDebateIngestRequest(BaseModel):
+    app_id: str = "cl2"
     tenantId: str
     sessionId: str
     agentA: str
@@ -118,32 +135,68 @@ async def peaje_ingest(request: PeajeIngestRequest):
         if conn:
             try:
                 with conn.cursor() as cursor:
-                    # ═══ STEP 3: Insert insight with v2.0 schema ═══
-                    sql = """
-                        INSERT INTO peaje_insights 
-                        (tenant_id, session_id, agent_id, insight_text, 
-                         category, sub_category, industry_vertical,
-                         sentiment, confidence_score, extraction_model, pii_scrubbed,
-                         source_type, anonymized_hash, raw_conversation_hash)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                    """
-                    cursor.execute(sql, (
-                        request.tenantId,
-                        request.sessionId,
-                        request.agentId,
-                        scrub_result["scrubbed_text"],
-                        scrub_result["validated_category"],
-                        scrub_result["sub_category"],
-                        scrub_result["industry_vertical"],
-                        insight_data["sentiment"],
-                        insight_data["confidence_score"],
-                        extraction_model,
-                        scrub_result["pii_scrubbed"],
-                        "chat",
-                        anonymized_hash,
-                        conversation_hash
-                    ))
-                    insight_id = cursor.lastrowid
+                    # ═══ STEP 3: Insert insight with v3 multi-app schema ═══
+                    # app_id (default 'cl2' from Pydantic) lands the insight
+                    # in the correct app bucket so retrieval per-app works.
+                    # Try v3 INSERT (with app_id); fall back to v2 (without)
+                    # if the column is missing — keeps deploys decoupled
+                    # from the schema migration.
+                    insight_id = None
+                    try:
+                        sql_v3 = """
+                            INSERT INTO peaje_insights
+                            (app_id, tenant_id, session_id, agent_id, insight_text,
+                             category, sub_category, industry_vertical,
+                             sentiment, confidence_score, extraction_model, pii_scrubbed,
+                             source_type, anonymized_hash, raw_conversation_hash)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        """
+                        cursor.execute(sql_v3, (
+                            request.app_id,
+                            request.tenantId,
+                            request.sessionId,
+                            request.agentId,
+                            scrub_result["scrubbed_text"],
+                            scrub_result["validated_category"],
+                            scrub_result["sub_category"],
+                            scrub_result["industry_vertical"],
+                            insight_data["sentiment"],
+                            insight_data["confidence_score"],
+                            extraction_model,
+                            scrub_result["pii_scrubbed"],
+                            "chat",
+                            anonymized_hash,
+                            conversation_hash
+                        ))
+                        insight_id = cursor.lastrowid
+                    except Exception as v3_err:
+                        # peaje_insights.app_id column missing → fallback v2
+                        print(f"[EL PEAJE v2] v3 INSERT failed ({v3_err}); fallback v2")
+                        sql_v2 = """
+                            INSERT INTO peaje_insights
+                            (tenant_id, session_id, agent_id, insight_text,
+                             category, sub_category, industry_vertical,
+                             sentiment, confidence_score, extraction_model, pii_scrubbed,
+                             source_type, anonymized_hash, raw_conversation_hash)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        """
+                        cursor.execute(sql_v2, (
+                            request.tenantId,
+                            request.sessionId,
+                            request.agentId,
+                            scrub_result["scrubbed_text"],
+                            scrub_result["validated_category"],
+                            scrub_result["sub_category"],
+                            scrub_result["industry_vertical"],
+                            insight_data["sentiment"],
+                            insight_data["confidence_score"],
+                            extraction_model,
+                            scrub_result["pii_scrubbed"],
+                            "chat",
+                            anonymized_hash,
+                            conversation_hash
+                        ))
+                        insight_id = cursor.lastrowid
                     
                     # ═══ STEP 4: Update session tracking ═══
                     session_sql = """
@@ -191,15 +244,37 @@ async def peaje_ingest(request: PeajeIngestRequest):
                     ))
                     
                     conn.commit()
-                    
+
                 print(f"[EL PEAJE v2] ✓ Insight saved ID:{insight_id} | "
+                      f"app:{request.app_id} | "
                       f"PII:{scrub_result['total_pii_scrubbed']} | "
                       f"Cat:{scrub_result['validated_category']} | "
                       f"{extraction_duration_ms}ms")
-                
+
+                # ═══ STEP 6: insight-router (v3 multi-app) ═══
+                # Best-effort. The agent decides target app, sub-category
+                # and whether the pattern is generalizable to global RAG.
+                # Audit row goes to peaje_router_decisions. Failures here
+                # never break ingest — fallback is review_required=True.
+                if insight_id is not None:
+                    try:
+                        await route_insight(
+                            insight_id=insight_id,
+                            source_app=request.app_id,
+                            tenant_id=request.tenantId,
+                            industry_vertical=scrub_result.get("industry_vertical") or tenant_industry,
+                            insight_text=scrub_result["scrubbed_text"],
+                            extraction_model=extraction_model,
+                            session_type="chat",
+                            tenant_metadata=None,
+                        )
+                    except Exception as route_err:
+                        print(f"[EL PEAJE v2 ROUTER] {route_err}")
+
                 return {
                     "status": "ingested",
-                    "version": "v2.0",
+                    "version": "v3",
+                    "app_id": request.app_id,
                     "tenant": request.tenantId,
                     "insight_id": insight_id,
                     "category": scrub_result["validated_category"],
@@ -279,30 +354,59 @@ async def peaje_ingest_debate(request: PeajeDebateIngestRequest):
                         anonymized_hash = hashlib.sha256(f"{request.tenantId}:{request.sessionId}:debate:{i}".encode()).hexdigest()
                         
                         with conn.cursor() as cursor:
-                            cursor.execute("""
-                                INSERT INTO peaje_insights 
-                                (tenant_id, session_id, agent_id, insight_text, 
-                                 category, sub_category, industry_vertical,
-                                 sentiment, confidence_score, extraction_model, pii_scrubbed,
-                                 source_type, debate_turn, anonymized_hash, raw_conversation_hash)
-                                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                            """, (
-                                request.tenantId,
-                                request.sessionId,
-                                turn_agent,
-                                scrub_result["scrubbed_text"],
-                                scrub_result["validated_category"],
-                                scrub_result["sub_category"],
-                                scrub_result["industry_vertical"],
-                                insight_data["sentiment"],
-                                insight_data["confidence_score"],
-                                "moonshotai/kimi-k2.6",
-                                scrub_result["pii_scrubbed"],
-                                "debate",
-                                i + 1,
-                                anonymized_hash,
-                                conversation_hash
-                            ))
+                            # v3 INSERT (with app_id) → fallback v2 if column missing
+                            try:
+                                cursor.execute("""
+                                    INSERT INTO peaje_insights
+                                    (app_id, tenant_id, session_id, agent_id, insight_text,
+                                     category, sub_category, industry_vertical,
+                                     sentiment, confidence_score, extraction_model, pii_scrubbed,
+                                     source_type, debate_turn, anonymized_hash, raw_conversation_hash)
+                                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                                """, (
+                                    request.app_id,
+                                    request.tenantId,
+                                    request.sessionId,
+                                    turn_agent,
+                                    scrub_result["scrubbed_text"],
+                                    scrub_result["validated_category"],
+                                    scrub_result["sub_category"],
+                                    scrub_result["industry_vertical"],
+                                    insight_data["sentiment"],
+                                    insight_data["confidence_score"],
+                                    "moonshotai/kimi-k2.6",
+                                    scrub_result["pii_scrubbed"],
+                                    "debate",
+                                    i + 1,
+                                    anonymized_hash,
+                                    conversation_hash
+                                ))
+                            except Exception:
+                                cursor.execute("""
+                                    INSERT INTO peaje_insights
+                                    (tenant_id, session_id, agent_id, insight_text,
+                                     category, sub_category, industry_vertical,
+                                     sentiment, confidence_score, extraction_model, pii_scrubbed,
+                                     source_type, debate_turn, anonymized_hash, raw_conversation_hash)
+                                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                                """, (
+                                    request.tenantId,
+                                    request.sessionId,
+                                    turn_agent,
+                                    scrub_result["scrubbed_text"],
+                                    scrub_result["validated_category"],
+                                    scrub_result["sub_category"],
+                                    scrub_result["industry_vertical"],
+                                    insight_data["sentiment"],
+                                    insight_data["confidence_score"],
+                                    "moonshotai/kimi-k2.6",
+                                    scrub_result["pii_scrubbed"],
+                                    "debate",
+                                    i + 1,
+                                    anonymized_hash,
+                                    conversation_hash
+                                ))
+                            debate_insight_id = cursor.lastrowid
                             
                             cursor.execute("""
                                 INSERT INTO peaje_sessions 
@@ -320,6 +424,22 @@ async def peaje_ingest_debate(request: PeajeDebateIngestRequest):
                         
                         conn.commit()
                         insights_saved += 1
+
+                        # Route per turn (best-effort) → bucket + global
+                        if debate_insight_id is not None:
+                            try:
+                                await route_insight(
+                                    insight_id=debate_insight_id,
+                                    source_app=request.app_id,
+                                    tenant_id=request.tenantId,
+                                    industry_vertical=scrub_result.get("industry_vertical"),
+                                    insight_text=scrub_result["scrubbed_text"],
+                                    extraction_model="moonshotai/kimi-k2.6",
+                                    session_type="debate",
+                                    tenant_metadata={"debate_turn": i + 1, "topic": request.topic[:200]},
+                                )
+                            except Exception as r_err:
+                                errors.append(f"Turn {i} router: {str(r_err)}")
                     except Exception as db_err:
                         errors.append(f"Turn {i}: {str(db_err)}")
                     finally:
@@ -346,31 +466,72 @@ async def peaje_ingest_debate(request: PeajeDebateIngestRequest):
                 if conn:
                     try:
                         with conn.cursor() as cursor:
-                            cursor.execute("""
-                                INSERT INTO peaje_insights 
-                                (tenant_id, session_id, agent_id, insight_text, 
-                                 category, sub_category, industry_vertical,
-                                 sentiment, confidence_score, extraction_model, pii_scrubbed,
-                                 source_type, anonymized_hash, raw_conversation_hash)
-                                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                            """, (
-                                request.tenantId,
-                                request.sessionId,
-                                "debate_judge",
-                                synth_scrub["scrubbed_text"],
-                                synth_scrub["validated_category"],
-                                synth_scrub["sub_category"],
-                                synth_scrub["industry_vertical"],
-                                synth_data["sentiment"],
-                                min(synth_data["confidence_score"] + 0.10, 0.99),
-                                "moonshotai/kimi-k2.6",
-                                synth_scrub["pii_scrubbed"],
-                                "debate",
-                                hashlib.sha256(f"{request.tenantId}:{request.sessionId}:synthesis".encode()).hexdigest(),
-                                hashlib.sha256(request.synthesis[:200].encode()).hexdigest(),
-                            ))
+                            try:
+                                cursor.execute("""
+                                    INSERT INTO peaje_insights
+                                    (app_id, tenant_id, session_id, agent_id, insight_text,
+                                     category, sub_category, industry_vertical,
+                                     sentiment, confidence_score, extraction_model, pii_scrubbed,
+                                     source_type, anonymized_hash, raw_conversation_hash)
+                                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                                """, (
+                                    request.app_id,
+                                    request.tenantId,
+                                    request.sessionId,
+                                    "debate_judge",
+                                    synth_scrub["scrubbed_text"],
+                                    synth_scrub["validated_category"],
+                                    synth_scrub["sub_category"],
+                                    synth_scrub["industry_vertical"],
+                                    synth_data["sentiment"],
+                                    min(synth_data["confidence_score"] + 0.10, 0.99),
+                                    "moonshotai/kimi-k2.6",
+                                    synth_scrub["pii_scrubbed"],
+                                    "debate",
+                                    hashlib.sha256(f"{request.tenantId}:{request.sessionId}:synthesis".encode()).hexdigest(),
+                                    hashlib.sha256(request.synthesis[:200].encode()).hexdigest(),
+                                ))
+                            except Exception:
+                                cursor.execute("""
+                                    INSERT INTO peaje_insights
+                                    (tenant_id, session_id, agent_id, insight_text,
+                                     category, sub_category, industry_vertical,
+                                     sentiment, confidence_score, extraction_model, pii_scrubbed,
+                                     source_type, anonymized_hash, raw_conversation_hash)
+                                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                                """, (
+                                    request.tenantId,
+                                    request.sessionId,
+                                    "debate_judge",
+                                    synth_scrub["scrubbed_text"],
+                                    synth_scrub["validated_category"],
+                                    synth_scrub["sub_category"],
+                                    synth_scrub["industry_vertical"],
+                                    synth_data["sentiment"],
+                                    min(synth_data["confidence_score"] + 0.10, 0.99),
+                                    "moonshotai/kimi-k2.6",
+                                    synth_scrub["pii_scrubbed"],
+                                    "debate",
+                                    hashlib.sha256(f"{request.tenantId}:{request.sessionId}:synthesis".encode()).hexdigest(),
+                                    hashlib.sha256(request.synthesis[:200].encode()).hexdigest(),
+                                ))
+                            synth_insight_id = cursor.lastrowid
                         conn.commit()
                         insights_saved += 1
+                        if synth_insight_id is not None:
+                            try:
+                                await route_insight(
+                                    insight_id=synth_insight_id,
+                                    source_app=request.app_id,
+                                    tenant_id=request.tenantId,
+                                    industry_vertical=synth_scrub.get("industry_vertical"),
+                                    insight_text=synth_scrub["scrubbed_text"],
+                                    extraction_model="moonshotai/kimi-k2.6",
+                                    session_type="debate",
+                                    tenant_metadata={"phase": "synthesis", "topic": request.topic[:200]},
+                                )
+                            except Exception as r_err:
+                                errors.append(f"Synthesis router: {str(r_err)}")
                     except Exception as synth_db_err:
                         errors.append(f"Synthesis: {str(synth_db_err)}")
                     finally:
@@ -382,8 +543,9 @@ async def peaje_ingest_debate(request: PeajeDebateIngestRequest):
         
         return {
             "status": "ingested",
-            "version": "v2.0",
+            "version": "v3",
             "source": "debate",
+            "app_id": request.app_id,
             "tenant": request.tenantId,
             "insights_saved": insights_saved,
             "turns_processed": len(request.transcript),
