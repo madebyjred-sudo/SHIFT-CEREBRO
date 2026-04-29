@@ -24,14 +24,27 @@ load_dotenv()
 app = FastAPI(title="Shift Lab Swarm Cerebro v3 - Legio Digitalis Latina")
 
 # CORS
+# Lista blanca explícita de orígenes (CL2, dev local, dominios producción
+# conocidos) — controlado por ALLOWED_ORIGINS env var.
 ALLOWED_ORIGINS = os.getenv(
     "ALLOWED_ORIGINS",
     "http://localhost:3000,http://localhost:3001,http://localhost:5173"
 ).split(",")
 
+# allow_origin_regex cubre deploys dinámicos donde el dominio cambia con
+# cada build (Vercel preview deploys: shiftstudio-xxx.vercel.app, etc).
+# Sin esto, el widget <cerebro-feedback> hosteado acá no carga como
+# `<script type="module">` desde apps externas (CORS bloquea silencioso)
+# y los POST a /v1/feedback rebotan en preflight 400.
+ALLOWED_ORIGIN_REGEX = os.getenv(
+    "ALLOWED_ORIGIN_REGEX",
+    r"https://(.*\.)?(vercel\.app|shiftpn\.com|shiftlabdev\.space|run\.app)$",
+)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[origin.strip() for origin in ALLOWED_ORIGINS],
+    allow_origin_regex=ALLOWED_ORIGIN_REGEX,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
